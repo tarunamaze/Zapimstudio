@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -135,18 +136,36 @@ def main():
             account = admin.call(f'/api/brands/{a["id"]}/accounts', "POST", {"platform": "Facebook", "name": "Test only", "externalId": "123456789", "token": "test-token-never-used-externally", "expiresAt": "2035-01-01T00:00:00Z"})
             check("protectedToken" not in account and "token" not in account, "Account responses never expose tokens")
             check(all("protectedToken" not in x for x in editor.call(f'/api/brands/{a["id"]}/accounts')), "Account listing redacts secrets")
-            import sqlite3
             with sqlite3.connect(Path(tmp) / "marketing.db") as db:
                 protected = db.execute('SELECT ProtectedToken FROM Accounts LIMIT 1').fetchone()[0]
                 check("test-token" not in protected and len(protected) > 40, "Social tokens are encrypted at rest")
             check(len(editor.call("/api/audit")) >= 4, "Review history is recorded")
+            anon = Client()
+            anon.session()
+            anon.call("/api/login", "POST", {}, expected=400)
+            anon.call("/api/login", "POST", {"email": None, "password": PASSWORD}, expected=400)
+            check(True, "Missing or null JSON fields return 400, not 500")
+            # Seed scheduled posts directly; neither path below reaches a social API.
+            stale = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Stale", platform="Facebook"))
+            unverified = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Unverified", platform="Facebook"))
+            with sqlite3.connect(Path(tmp) / "marketing.db") as db:
+                db.execute("UPDATE Posts SET Status='Scheduled', ScheduledAt=datetime('now','-3 hours') WHERE Id=?", (stale["id"],))
+                db.execute("UPDATE Posts SET Status='Scheduled', ScheduledAt=datetime('now','-1 minutes') WHERE Id=?", (unverified["id"],))
             process.terminate()
             process.wait(timeout=10)
+            env["Publishing__Enabled"] = "true"
             process = start()
             persisted = Client()
             persisted.login("admin@example.com")
             check(any(p["caption"] == "Revised copy" for p in persisted.call("/api/posts")), "Drafts survive application restart")
             check(not persisted.session()["setupRequired"], "Setup remains closed after restart")
+            for _ in range(60):
+                posts = {p["id"]: p for p in persisted.call("/api/posts")}
+                if posts[stale["id"]]["status"] != "Scheduled" and posts[unverified["id"]]["status"] != "Scheduled":
+                    break
+                time.sleep(.5)
+            check(posts[stale["id"]]["status"] == "NeedsAttention" and "Nothing was sent" in posts[stale["id"]]["error"], "Overdue scheduled posts are not published late")
+            check(posts[unverified["id"]]["status"] == "NeedsAttention" and "not been verified" in posts[unverified["id"]]["error"], "Unverified account tokens are never used to publish")
             persisted.call("/api/logout", "POST")
             persisted.call("/api/posts", expected=401)
             check(True, "Sign-out removes access")

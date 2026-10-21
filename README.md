@@ -47,6 +47,8 @@ dotnet user-secrets set 'Bootstrap:Password' 'A_UNIQUE_LONG_PASSWORD'
 | `Publishing__Enabled` | Default `false`. Set `true` only when live publication is intended. |
 | `Publishing__MetaVersion` | Graph API version, default `v25.0`; align with the version supported by your Meta app. |
 | `Publishing__LinkedInVersion` | LinkedIn API version, default `202610`; update before it sunsets. |
+| `Publishing__MaxLatenessMinutes` | Default `60`. A scheduled post that the scheduler reaches later than this (after downtime, or while publishing was disabled) is not sent; it becomes **Needs attention** so it can be rescheduled. |
+| `ASPNETCORE_FORWARDEDHEADERS_ENABLED` | Set `true` only behind a reverse proxy, so client IPs (login rate limiting) and HTTPS (HSTS) are read from `X-Forwarded-*`. Already set in `compose.yaml` and `render.yaml`. Do not set it when the app is directly reachable. |
 
 The creative builder runs in the browser and produces a 1080×1080 JPEG without an AI key. AI calls require an account with model access and incur provider charges. Generated images and copy remain drafts until reviewed.
 
@@ -62,7 +64,7 @@ This first version uses **manually provisioned platform tokens**, not an OAuth c
 
 Meta retrieves approved media from `/media/{random-asset-id}`. Only assets referenced by scheduled, publishing, published or uncertain-delivery posts are exposed there, and only when `PublicBaseUrl` is set to HTTPS. Draft uploads and logos remain authenticated. Approved campaign images must therefore be appropriate for public retrieval when queued.
 
-The hosted worker checks due posts every 15 seconds and claims each post atomically. A post becomes **Published** only after a platform response includes a post identifier. Interrupted/uncertain attempts become **Needs attention**. Check the actual social profile before duplicating a replacement draft, to avoid duplicate posts. There is no automatic retry of a publish call.
+The hosted worker checks due posts every 15 seconds and claims each post atomically. Posts more than `Publishing__MaxLatenessMinutes` overdue are not published. Replacing an account token clears its verification; scheduled posts for that account will not publish until it is verified again. A post becomes **Published** only after a platform response includes a post identifier. Interrupted/uncertain attempts become **Needs attention**. Check the actual social profile before duplicating a replacement draft, to avoid duplicate posts. There is no automatic retry of a publish call.
 
 ## Deploy
 

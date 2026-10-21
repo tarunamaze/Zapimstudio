@@ -34,6 +34,9 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     };
 });
 builder.Services.AddAuthorization();
+// Reject missing or null JSON fields as 400s instead of failing later with a NullReferenceException.
+builder.Services.ConfigureHttpJsonOptions(o => { o.SerializerOptions.RespectNullableAnnotations = true; o.SerializerOptions.RespectRequiredConstructorParameters = true; });
+builder.Services.Configure<RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
 builder.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = 429;
@@ -80,6 +83,7 @@ app.Use(async (ctx, next) =>
     catch (RuleException e) { ctx.Response.StatusCode = e.Status; await ctx.Response.WriteAsJsonAsync(new { error = e.Message }); }
     catch (DbUpdateConcurrencyException) { ctx.Response.StatusCode = 409; await ctx.Response.WriteAsJsonAsync(new { error = "This post changed. Refresh and try again." }); }
     catch (AntiforgeryValidationException) { ctx.Response.StatusCode = 400; await ctx.Response.WriteAsJsonAsync(new { error = "Your session token expired. Refresh this page." }); }
+    catch (BadHttpRequestException e) when (!ctx.Response.HasStarted) { ctx.Response.StatusCode = e.StatusCode; await ctx.Response.WriteAsJsonAsync(new { error = "The request was incomplete or invalid. Refresh and try again." }); }
     catch (Exception e) when (!ctx.Response.HasStarted)
     {
         app.Logger.LogError("Request failed: {Type}", e.GetType().Name);

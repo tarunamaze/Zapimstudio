@@ -38,6 +38,8 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
     public async Task<string> Publish(Post post, SocialAccount a, CancellationToken ct)
     {
         Rules.Require(a.ExpiresAt > DateTime.UtcNow, "Account token expired. Reconnect the account.");
+        // Replacing a token clears VerifiedAt; never publish with a token nobody has verified.
+        Rules.Require(a.VerifiedAt.HasValue, "The account token was replaced and has not been verified. Verify the account, then reschedule this post.");
         var image = post.AssetId.Length > 0 ? await db.Assets.FindAsync([post.AssetId], ct) : null;
         var mediaUrl = $"{config["PublicBaseUrl"]?.TrimEnd('/')}/media/{post.AssetId}";
         if (a.Platform == "LinkedIn")
@@ -109,8 +111,17 @@ public class PublishingWorker(IServiceScopeFactory scopes, IConfiguration config
             {
                 using var scope = scopes.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<MarketingDb>();
                 var due = await db.Posts.AsNoTracking().Where(x => x.Status == "Scheduled" && x.ScheduledAt <= DateTime.UtcNow).OrderBy(x => x.ScheduledAt).Take(10).ToListAsync(stoppingToken);
+                var maxLateness = TimeSpan.FromMinutes(config.GetValue("Publishing:MaxLatenessMinutes", 60));
                 foreach (var p in due)
                 {
+                    // After downtime or while publishing was disabled, don't release a backlog of stale posts at the wrong time.
+                    if (p.ScheduledAt < DateTime.UtcNow - maxLateness)
+                    {
+                        var error = $"Not published: the scheduled time passed more than {maxLateness.TotalMinutes:0} minutes before the scheduler could run. Nothing was sent. Duplicate the post and schedule a new time.";
+                        var expired = await db.Posts.Where(x => x.Id == p.Id && x.Status == "Scheduled" && x.Version == p.Version).ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "NeedsAttention").SetProperty(x => x.Error, error).SetProperty(x => x.Version, x => x.Version + 1).SetProperty(x => x.UpdatedAt, DateTime.UtcNow), stoppingToken);
+                        if (expired == 1) { db.Audit.Add(new AuditEntry { BrandId = p.BrandId, PostId = p.Id, Action = "Missed schedule; not published" }); await db.SaveChangesAsync(stoppingToken); }
+                        continue;
+                    }
                     var claimed = await db.Posts.Where(x => x.Id == p.Id && x.Status == "Scheduled" && x.Version == p.Version).ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "Publishing").SetProperty(x => x.Version, x => x.Version + 1).SetProperty(x => x.UpdatedAt, DateTime.UtcNow), stoppingToken);
                     if (claimed != 1) continue;
                     var post = await db.Posts.FindAsync([p.Id], stoppingToken);
