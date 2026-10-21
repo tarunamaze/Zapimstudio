@@ -1,0 +1,8 @@
+bin/
+obj/
+App_Data/
+.env
+*.user
+appsettings.*.json
+!appsettings.json
+__pycache__/
