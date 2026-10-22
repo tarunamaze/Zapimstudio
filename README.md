@@ -1,6 +1,6 @@
 # Zapim Studio
 
-An internal multi-brand marketing portal built with ASP.NET Core 10, EF Core/SQLite, and a responsive HTML/CSS/JavaScript interface. No Node build step is required.
+An internal multi-brand marketing portal built with ASP.NET Core 10, EF Core (SQLite or SQL Server), and a responsive HTML/CSS/JavaScript interface. No Node build step is required.
 
 ## Included
 
@@ -24,7 +24,7 @@ dotnet run --launch-profile Zapim
 
 Open **http://localhost:5080**. On a new development database, create your first administrator using the setup screen. There is no default password. Three clearly labelled starter drafts are seeded for Zapim. No accounts are connected and nothing is published automatically.
 
-All records, uploaded images and encryption keys are stored in `App_Data/` by default. This directory is ignored by Git. Keep backups of the entire directory: without the keys, saved social tokens cannot be decrypted.
+All records (unless SQL Server is configured), uploaded images and encryption keys are stored in `App_Data/` by default. This directory is ignored by Git. Keep backups of the entire directory: without the keys, saved social tokens cannot be decrypted.
 
 ## Configuration
 
@@ -39,6 +39,7 @@ dotnet user-secrets set 'Bootstrap:Password' 'A_UNIQUE_LONG_PASSWORD'
 | Environment variable | Purpose |
 | --- | --- |
 | `StoragePath` | Persistent directory containing SQLite, images and keys. |
+| `ConnectionStrings__SqlServer` | Use SQL Server instead of SQLite. Point it at a dedicated, empty database; tables are created on first start. |
 | `Bootstrap__Email`, `Bootstrap__Password` | Create the first administrator if no users exist. Required for first production startup; remove after initialization. Password minimum: 12 characters. |
 | `AI__ApiKey` | Enables OpenAI copy and image generation. Without it, copy generation is explicitly labelled as a starter template. |
 | `AI__TextModel` | Configurable Responses API model. Default: `gpt-4.1-mini`. |
@@ -74,6 +75,10 @@ The included `render.yaml` declares a free Docker web service with a `/health` c
 
 This is a disposable demo: Render Free has no persistent disk and sleeps after inactivity. Brands, drafts, uploads, team accounts and encryption keys reset when the container is replaced. Keep the bootstrap settings on this demo so your administrator account is recreated after a reset. Do not rely on this deployment for unattended scheduled publishing.
 
+### Windows Server with IIS and SQL Server
+
+See [deploy/iis/README.md](deploy/iis/README.md): a one-time setup script for IIS and SQL Server, and a GitHub Actions workflow that tests and deploys every push to `main` through a self-hosted runner.
+
 ### Persistent hosting
 
 Run on a .NET-capable host (Azure App Service, Linux service, IIS or Docker). The Sites plugin's JavaScript Worker hosting cannot execute this ASP.NET Core app.
@@ -102,7 +107,7 @@ node --check wwwroot/app.js
 python3 tests/smoke.py
 ```
 
-The smoke suite creates a temporary database and runs the compiled application on a local port. It exercises authentication, anti-CSRF enforcement, brand isolation, role checks, draft/review/approval transitions, stale updates, approval invalidation, disabled publishing and durable records. It never calls external social APIs. See `tests/smoke.py` for prerequisites and overrides.
+The smoke suite creates a temporary database and runs the compiled application on a local port. Set `TEST_SQLSERVER` and `TEST_SQLCMD` to run it against SQL Server instead of SQLite (see the top of `tests/smoke.py`); CI runs both. It exercises authentication, anti-CSRF enforcement, brand isolation, role checks, draft/review/approval transitions, stale updates, approval invalidation, disabled publishing and durable records. It never calls external social APIs. See `tests/smoke.py` for prerequisites and overrides.
 
 ## Current boundaries
 
