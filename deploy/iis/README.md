@@ -1,91 +1,88 @@
 # Deploying to Windows Server with IIS and SQL Server
 
-Every push to `main` (or a manual run of **Test and deploy** in the Actions tab) runs the smoke tests on GitHub-hosted runners against both SQLite and SQL Server, then a self-hosted runner on your server publishes the app and copies it into the IIS site.
-
-```
-push to main ─▶ test (ubuntu, SQLite + SQL Server) ─▶ deploy (your server's runner) ─▶ IIS site ─▶ /health check
-```
+The app runs as the IIS site **`zapimmarketing`** on **169.58.88.219**, next to HRMS, with its own SQL Server database **`ZapimMarketing`**. It is published the same way as HRMS: Web Deploy from Visual Studio over `https://169.58.88.219:8172/msdeploy.axd`. A GitHub Actions workflow with a self-hosted runner is available as an alternative ([below](#alternative-deploy-from-github-actions)).
 
 What lives where on the server:
 
 | Location | Contents | Changed by deployments? |
 | --- | --- | --- |
-| `C:\inetpub\zapim-studio` | The published app and `web.config` | Yes, mirrored on every deploy |
-| `C:\inetpub\zapim-studio\appsettings.Production.json` | Connection string, admin bootstrap, AI key, publishing settings | No, server-only, never in Git |
-| `C:\ZapimStudioData` | Uploaded images (`assets`) and the encryption key ring (`keys`) | No |
-| SQL Server database `ZapimStudio` | All records | No (tables are created on first start) |
+| The `zapimmarketing` site folder (e.g. `C:\inetpub\zapimmarketing`) | The published app and `web.config` | Yes |
+| `appsettings.Production.json` in the site folder | Connection string, admin bootstrap, AI key, publishing settings | No, server-only, never in Git |
+| `C:\ZapimMarketingData` | Uploaded images (`assets`) and the encryption key ring (`keys`) | No |
+| SQL Server database `ZapimMarketing` | All records | No (tables are created on first start) |
 
 ## 1. Prerequisites (once)
 
-1. **.NET 10 Hosting Bundle.** Download it from <https://dotnet.microsoft.com/download/dotnet/10.0> (under *ASP.NET Core Runtime → Windows → Hosting Bundle*), install it, then run `iisreset`.
-2. **DNS:** an `A` record for your subdomain (e.g. `studio.yourcompany.com`) pointing at the server.
-3. **HTTPS certificate** for that subdomain in the machine's *Personal* (`My`) certificate store. A corporate certificate works, or a free one from Let's Encrypt via [win-acme](https://www.win-acme.com/). Note its thumbprint (`Get-ChildItem Cert:\LocalMachine\My`). **Sign-in only works over HTTPS**: the session cookie is marked Secure in production.
-4. **SQL Server 2016 or newer** on the same machine (any edition, including Express).
+1. **.NET 10 Hosting Bundle.** HRMS uses .NET 8, so the server most likely does not have it yet. Download it from <https://dotnet.microsoft.com/download/dotnet/10.0> (*ASP.NET Core Runtime → Windows → Hosting Bundle*), install it, then run `iisreset`. It installs side by side and does not change HRMS, but `iisreset` restarts every site, HRMS included, for a few seconds: do it outside working hours.
+2. **A host name and HTTPS certificate.** **Sign-in only works over HTTPS**: the session cookie is marked Secure in production, so an HTTP-only or bare-IP site shows the sign-in page but never signs in. The host name is **`zapimmarketing.duckdns.org`**:
+   1. In [DuckDNS](https://www.duckdns.org), point the `zapimmarketing` subdomain at 169.58.88.219. Check with `nslookup zapimmarketing.duckdns.org`.
+   2. Make sure the `zapimmarketing` site has an HTTP binding on port 80 for `zapimmarketing.duckdns.org` (IIS Manager → site → Bindings), and port 80 is open in the firewall: Let's Encrypt validates over HTTP.
+   3. Get a free certificate with [win-acme](https://www.win-acme.com/) (`wacs.exe` → *Create certificate (default settings)* → pick the `zapimmarketing` site). It adds the HTTPS binding and renews automatically. Note the certificate's thumbprint: `Get-ChildItem Cert:\LocalMachine\My | Where-Object Subject -like '*zapimmarketing*'`.
+3. **SQL Server** on the same machine: the default instance on port 1433 that HRMS uses is fine. `sqlcmd` is already installed (the HRMS migration scripts use it).
 
-## 2. A runner for this repository
+## 2. Prepare the server (once)
 
-GitHub runners on a personal account belong to one repository, so the runner that deploys your other app cannot pick up this repository's jobs. Register a second runner on the same server:
-
-1. GitHub → this repository → **Settings → Actions → Runners → New self-hosted runner → Windows**.
-2. Follow the commands shown there, but extract into a **new folder** (e.g. `C:\actions-runner-zapim`) so the existing runner is untouched.
-3. When `config.cmd` asks, accept the default labels and answer **Y** to *run as a service*. The service runs as `NT AUTHORITY\NETWORK SERVICE` by default; if you choose another account, pass it to the setup script as `-RunnerAccount`.
-
-**This repository is public.** The workflow never runs on pull requests, so code from forks cannot reach your server. To keep it that way, don't add `pull_request` triggers to workflows that use the self-hosted runner. Making the repository private is the safer option.
-
-## 3. Prepare the server (once)
-
-In an **elevated Windows PowerShell** on the server, from a checkout or download of this repository:
+Copy the `deploy\iis` folder to the server. In an **elevated Windows PowerShell** there:
 
 ```powershell
 cd deploy\iis
-.\setup-server.ps1 -HostName studio.yourcompany.com `
-                   -BootstrapEmail you@yourcompany.com `
+.\setup-server.ps1 -BootstrapEmail you@zapim.com `
+                   -HostName zapimmarketing.duckdns.org `
                    -CertificateThumbprint <THUMBPRINT>
 ```
 
 It prompts for the first administrator password (12+ characters), then:
 
-- creates the `ZapimStudio` app pool. It is always running, with no idle timeout, no timed recycling and no overlapping recycles, because the publishing scheduler runs inside the app.
-- creates the `Zapim Studio` IIS site with an HTTPS binding for your hostname and preload enabled.
-- creates `C:\ZapimStudioData`, readable only by the app pool and administrators.
-- writes `appsettings.Production.json` into the site folder. The connection string uses Windows authentication as the app pool identity, so no database password is stored.
-- grants the runner account write access to the site folder.
-- runs `create-database.sql` if `sqlcmd` is installed: it creates the `ZapimStudio` database and a login for `IIS APPPOOL\ZapimStudio` with `db_ddladmin`, `db_datareader` and `db_datawriter` on that database only.
+- uses the existing `zapimmarketing` site and its physical path. If that site shares its app pool with another site (e.g. `DefaultAppPool`), it gets its own `zapimmarketing` pool, so settings below never affect HRMS.
+- configures the app pool to run always, with no idle timeout, no timed recycling and no overlapping recycles, because the publishing scheduler runs inside the app.
+- adds an HTTPS binding for the host name with your certificate, and enables preload.
+- creates `C:\ZapimMarketingData`, readable only by the app pool and administrators.
+- writes `appsettings.Production.json` into the site folder. The connection string uses Windows authentication as the app pool identity, so no database password is stored. To use a SQL login instead (this server uses `sa`), see [SQL login](#sql-login).
+- with `-WebDeployUser`, lets a non-administrator Web Deploy account publish to this site. Not needed when publishing as `Administrator`.
+- **creates the database:** runs `create-database.sql`, which creates the empty `ZapimMarketing` database and a login for `IIS APPPOOL\zapimmarketing` with `db_ddladmin`, `db_datareader` and `db_datawriter` on that database only. It connects with your Windows account, which must be a SQL Server administrator. It does not touch the HRMS databases.
 
-The database step connects with your Windows account, which must be a SQL Server administrator. Without `sqlcmd`, open `create-database.sql` in SSMS, switch on **Query → SQLCMD Mode**, add these two lines at the top, and run it:
+Without `sqlcmd`, open `create-database.sql` in SSMS, switch on **Query → SQLCMD Mode**, add these two lines at the top, and run it:
 
 ```sql
-:setvar DatabaseName ZapimStudio
-:setvar AppLogin "IIS APPPOOL\ZapimStudio"
+:setvar DatabaseName ZapimMarketing
+:setvar AppLogin "IIS APPPOOL\zapimmarketing"
 ```
 
-The script is safe to re-run. It never overwrites an existing `appsettings.Production.json`. Run `Get-Help .\setup-server.ps1 -Full` for every option (paths, names, SQL instance such as `-SqlServer .\SQLEXPRESS`).
+The script is safe to re-run. It never overwrites an existing `appsettings.Production.json`. Without `-HostName` it reads the host name from the site's existing bindings; without `-CertificateThumbprint` it warns if the site has no HTTPS binding. Run `Get-Help .\setup-server.ps1 -Full` for every option (paths, names, `-SqlServer localhost,1433` or a named instance).
 
-> **Use a dedicated database.** The app creates its tables only when its database is empty. Do not point it at your other application's database.
+### SQL login
 
-## 4. Tell the workflow where to deploy
+The server's database connection uses `sa`. This writes the connection string into `appsettings.Production.json` without displaying the password, then restarts the app (elevated PowerShell on the server):
 
-GitHub → **Settings → Secrets and variables → Actions → Variables → New repository variable**:
+```powershell
+$f='C:\inetpub\wwwroot\zapimmarketingppsettings.Production.json'; $b=New-Object System.Data.SqlClient.SqlConnectionStringBuilder; $b['Data Source']='localhost'; $b['Initial Catalog']='ZapimMarketing'; $b['User ID']='sa'; $b['Password']=[Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host 'sa password' -AsSecureString))); $b['TrustServerCertificate']=$true; $j=Get-Content $f -Raw | ConvertFrom-Json; $j.ConnectionStrings.SqlServer=$b.ConnectionString; $j | ConvertTo-Json -Depth 5 | Set-Content $f -Encoding UTF8; Restart-WebAppPool zapimmarketing
+```
 
-| Variable | Example |
-| --- | --- |
-| `ZAPIM_SITE_PATH` | `C:\inetpub\zapim-studio` |
-| `ZAPIM_HEALTH_URL` | `https://studio.yourcompany.com/health` |
+A dedicated login with rights on `ZapimMarketing` only (like HRMS's `hrms_app`) is safer than `sa`: replace `sa` above with that login.
 
-No secrets are needed in GitHub: all credentials stay in `appsettings.Production.json` on the server.
+> **Use a dedicated database.** The app creates its tables only when its database is empty. Do not point it at an HRMS database.
 
-## 5. First deployment
+## 3. Publish from Visual Studio
 
-Merge to `main`, or run **Actions → Test and deploy → Run workflow**. On first start the app creates its tables and your administrator account. Then:
+Open the project, then **Build → Publish → zapimmarketing** (the profile is in `Properties\PublishProfiles\zapimmarketing.pubxml`) and enter the server's `Administrator` password when prompted. Accept the self-signed certificate on port 8172, as for HRMS.
 
-1. Sign in at `https://studio.yourcompany.com`.
-2. Remove the `Password` line under `Bootstrap` in `appsettings.Production.json` and recycle the `ZapimStudio` app pool.
+The profile never overwrites `appsettings.Production.json` or the `logs` folder, and takes the site offline (`app_offline.htm`) while copying. Publishing from the command line works too:
+
+```powershell
+dotnet publish Zapim.Marketing.csproj -c Release /p:PublishProfile=zapimmarketing /p:Password=<password>
+```
+
+## 4. First sign-in
+
+On first start the app creates its tables in `ZapimMarketing` and your administrator account. Then:
+
+1. Check `https://<host name>/health` returns `{"status":"ok"}`, and sign in.
+2. Remove the `Password` line under `Bootstrap` in `appsettings.Production.json` and recycle the `zapimmarketing` app pool.
 3. Optional: add `AI.ApiKey`, and set `Publishing.Enabled` to `true` once social accounts are connected (see the main README). Recycle the app pool after each change.
 
 ## Day-to-day
 
-- **Deploys** take the site offline for a few seconds (`app_offline.htm`), mirror the new build, and wait for `/health`. If copying fails the offline page stays up, so a half-copied build is never served; fix the cause and re-run the workflow.
-- **Backups:** back up the `ZapimStudio` database **and** `C:\ZapimStudioData`. Without the `keys` folder, saved social tokens cannot be decrypted and must be re-entered.
+- **Backups:** back up the `ZapimMarketing` database **and** `C:\ZapimMarketingData`. Without the `keys` folder, saved social tokens cannot be decrypted and must be re-entered. Add the database to whatever backs up the HRMS databases.
 - **Run one instance only.** Don't add the site to a web farm or a second server.
 - **Schema changes:** tables are created with `EnsureCreated`, which never alters existing tables. Future model changes need a migration plan before deploying.
 
@@ -93,8 +90,32 @@ Merge to `main`, or run **Actions → Test and deploy → Run workflow**. On fir
 
 | Symptom | Check |
 | --- | --- |
-| Deploy job stays *Queued* | The runner for **this** repository is offline: `Get-Service actions.runner.*`. |
-| `Access to the path ... is denied` during deploy | The runner account lacks write access to the site folder: re-run `setup-server.ps1` with the right `-RunnerAccount`. |
-| HTTP 500.30 / health check fails | Event Viewer → Windows Logs → Application, source *IIS AspNetCore Module V2*. For more detail set `stdoutLogEnabled="true"` in the site's `web.config` temporarily (it is replaced on the next deploy). |
-| `Login failed for user 'IIS APPPOOL\ZapimStudio'` | `create-database.sql` was not run, or was run against another instance or database name. |
-| Sign-in does nothing / returns to the sign-in page | The site is being reached over HTTP. Use the HTTPS address. |
+| HTTP 500.31 / 500.30 right after the first publish | The .NET 10 Hosting Bundle is missing, or `iisreset` was not run after installing it. |
+| HTTP 500.30 / health check fails | Event Viewer → Windows Logs → Application, source *IIS AspNetCore Module V2*. For more detail set `stdoutLogEnabled="true"` in the site's `web.config` temporarily (it is replaced on the next publish). |
+| `Login failed for user 'IIS APPPOOL\zapimmarketing'` | `create-database.sql` was not run, or was run against another instance or database name. If the site's pool has another name, the login must match it: re-run `setup-server.ps1`. |
+| Publish fails with 401 / `ERROR_USER_UNAUTHORIZED` | Wrong password, or a non-administrator deploy account without permission on `zapimmarketing`: re-run `setup-server.ps1` with `-WebDeployUser`. |
+| `UnauthorizedAccessException` for `...\zapimmarketing\App_Data` | `appsettings.Production.json` is missing, so the app falls back to the site folder: run `setup-server.ps1`. |
+| HTTP 500.31 just after installing .NET 10 | The app pool still runs the process that failed before: `Restart-WebAppPool zapimmarketing`. |
+| Sign-in does nothing / returns to the sign-in page | The site is being reached over HTTP or by IP address. Use the HTTPS host name. |
+
+## Alternative: deploy from GitHub Actions
+
+Instead of publishing from Visual Studio, every push to `main` (or a manual run of **Test and deploy** in the Actions tab) can run the smoke tests on GitHub-hosted runners against SQLite and SQL Server, then publish and copy the app into the site from a self-hosted runner on the server. The deploy job is skipped until the `ZAPIM_SITE_PATH` variable is set.
+
+```
+push to main ─▶ test (ubuntu, SQLite + SQL Server) ─▶ deploy (your server's runner) ─▶ IIS site ─▶ /health check
+```
+
+1. **Register a runner:** GitHub → this repository → **Settings → Actions → Runners → New self-hosted runner → Windows**. Extract into its own folder (e.g. `C:\actions-runner-zapim`), accept the default labels and answer **Y** to *run as a service*. The service runs as `NT AUTHORITY\NETWORK SERVICE` by default; if you choose another account, pass it to `setup-server.ps1` as `-RunnerAccount`.
+2. **Set variables:** GitHub → **Settings → Secrets and variables → Actions → Variables**:
+
+   | Variable | Example |
+   | --- | --- |
+   | `ZAPIM_SITE_PATH` | `C:\inetpub\zapimmarketing` |
+   | `ZAPIM_HEALTH_URL` | `https://zapimmarketing.duckdns.org/health` |
+
+   No secrets are needed in GitHub: all credentials stay in `appsettings.Production.json` on the server.
+
+Each deploy takes the site offline for a few seconds (`app_offline.htm`), mirrors the new build and waits for `/health`. If copying fails the offline page stays up, so a half-copied build is never served; fix the cause and re-run the workflow. A queued deploy job means the runner is offline (`Get-Service actions.runner.*`); `Access to the path ... is denied` means the runner account lacks write access to the site folder.
+
+**This repository is public.** The workflow never runs on pull requests, so code from forks cannot reach your server. Don't add `pull_request` triggers to workflows that use the self-hosted runner. Making the repository private is the safer option.

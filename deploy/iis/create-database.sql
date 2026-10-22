@@ -1,5 +1,6 @@
 -- One-time SQL Server setup for Zapim Studio. Run as a SQL Server administrator, e.g.:
---   sqlcmd -S localhost -E -b -i create-database.sql -v DatabaseName="ZapimStudio" AppLogin="IIS APPPOOL\ZapimStudio"
+--   $env:DatabaseName = 'ZapimMarketing'; $env:AppLogin = 'IIS APPPOOL\zapimmarketing'
+--   sqlcmd -S localhost -E -C -b -i create-database.sql
 -- In SSMS, enable Query > SQLCMD Mode first.
 --
 -- Creates an empty, dedicated database and gives the IIS application pool identity the rights the app

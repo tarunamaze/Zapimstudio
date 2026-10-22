@@ -77,7 +77,7 @@ This is a disposable demo: Render Free has no persistent disk and sleeps after i
 
 ### Windows Server with IIS and SQL Server
 
-See [deploy/iis/README.md](deploy/iis/README.md): a one-time setup script for IIS and SQL Server, and a GitHub Actions workflow that tests and deploys every push to `main` through a self-hosted runner.
+See [deploy/iis/README.md](deploy/iis/README.md): a one-time setup script for IIS and SQL Server, a Visual Studio Web Deploy profile for the `zapimmarketing` site, and optionally a GitHub Actions workflow that tests and deploys every push to `main` through a self-hosted runner.
 
 ### Persistent hosting
 
