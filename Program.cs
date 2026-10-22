@@ -102,7 +102,8 @@ app.Use(async (ctx, next) =>
 if (!app.Environment.IsDevelopment()) app.UseHsts();
 app.UseDefaultFiles();
 // Revalidate on every load (a cheap 304 when unchanged) so browsers pick up a new deployment without a forced refresh.
-app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = f => f.Context.Response.Headers.CacheControl = "no-cache" });
+var revalidate = new StaticFileOptions { OnPrepareResponse = f => f.Context.Response.Headers.CacheControl = "no-cache" };
+app.UseStaticFiles(revalidate);
 app.UseAuthentication(); app.UseAuthorization(); app.UseRateLimiter();
 app.Use(async (ctx, next) =>
 {
@@ -318,7 +319,7 @@ api.MapPut("/team/{id:int}", async (int id, AccessInput input, HttpContext ctx, 
 });
 api.MapGet("/audit", async (HttpContext ctx, MarketingDb db) => { var ids = Rules.Brands(ctx, db).Select(x => x.Id); return await db.Audit.Where(x => ids.Contains(x.BrandId)).OrderByDescending(x => x.At).Take(100).ToListAsync(); });
 app.Map("/api/{**path}", () => Results.NotFound(new { error = "API endpoint not found." }));
-app.MapFallbackToFile("index.html");
+app.MapFallbackToFile("index.html", revalidate);
 app.Run();
 
 public record LoginInput(string Email, string Password);
