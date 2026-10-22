@@ -55,7 +55,7 @@ The script is safe to re-run. It never overwrites an existing `appsettings.Produ
 The server's database connection uses `sa`. This writes the connection string into `appsettings.Production.json` without displaying the password, then restarts the app (elevated PowerShell on the server):
 
 ```powershell
-$f='C:\inetpub\wwwroot\zapimmarketingppsettings.Production.json'; $b=New-Object System.Data.SqlClient.SqlConnectionStringBuilder; $b['Data Source']='localhost'; $b['Initial Catalog']='ZapimMarketing'; $b['User ID']='sa'; $b['Password']=[Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host 'sa password' -AsSecureString))); $b['TrustServerCertificate']=$true; $j=Get-Content $f -Raw | ConvertFrom-Json; $j.ConnectionStrings.SqlServer=$b.ConnectionString; $j | ConvertTo-Json -Depth 5 | Set-Content $f -Encoding UTF8; Restart-WebAppPool zapimmarketing
+$f='C:\inetpub\wwwroot\zapimmarketing\appsettings.Production.json'; $b=New-Object System.Data.SqlClient.SqlConnectionStringBuilder; $b['Data Source']='localhost'; $b['Initial Catalog']='ZapimMarketing'; $b['User ID']='sa'; $b['Password']=[Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host 'sa password' -AsSecureString))); $b['TrustServerCertificate']=$true; $j=Get-Content $f -Raw | ConvertFrom-Json; $j.ConnectionStrings.SqlServer=$b.ConnectionString; $j | ConvertTo-Json -Depth 5 | Set-Content $f -Encoding UTF8; Restart-WebAppPool zapimmarketing
 ```
 
 A dedicated login with rights on `ZapimMarketing` only (like HRMS's `hrms_app`) is safer than `sa`: replace `sa` above with that login.
@@ -78,7 +78,14 @@ On first start the app creates its tables in `ZapimMarketing` and your administr
 
 1. Check `https://<host name>/health` returns `{"status":"ok"}`, and sign in.
 2. Remove the `Password` line under `Bootstrap` in `appsettings.Production.json` and recycle the `zapimmarketing` app pool.
-3. Optional: add `AI.ApiKey`, and set `Publishing.Enabled` to `true` once social accounts are connected (see the main README). Recycle the app pool after each change.
+3. Connect Metricool (one account for all brands). This adds the Metricool token, which it asks for without displaying it, and user ID to `appsettings.Production.json` and restarts the app (elevated PowerShell on the server):
+
+   ```powershell
+   $f='C:\inetpub\wwwroot\zapimmarketing\appsettings.Production.json'; $j=Get-Content $f -Raw | ConvertFrom-Json; $t=[Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host 'Metricool API token' -AsSecureString))); $j | Add-Member -Force Metricool ([pscustomobject]@{ UserToken = $t; UserId = (Read-Host 'Metricool user ID') }); $j | ConvertTo-Json -Depth 5 | Set-Content $f -Encoding UTF8; Restart-WebAppPool zapimmarketing
+   ```
+
+   Then in **Accounts**, map each brand to its Metricool brand ID.
+4. Optional: add `AI.ApiKey`, and set `Publishing.Enabled` to `true` when you are ready for scheduled posts to go out. Recycle the app pool after each change.
 
 ## Day-to-day
 

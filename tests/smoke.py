@@ -6,6 +6,7 @@ command for the same server (e.g. "sqlcmd -S localhost -U sa -P ... -C"). A thro
 No external messages, provider calls or persistent workspace records are created.
 """
 import http.cookiejar
+import http.server
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -85,10 +87,49 @@ def brand(name):
     return {"name": name, "website": "https://example.com", "color": "#087f76", "tone": "Helpful", "audience": "Teams", "description": "A test brand"}
 
 
+class FakeMetricool(http.server.BaseHTTPRequestHandler):
+    """Stands in for app.metricool.com: one brand (4242) with LinkedIn and Facebook connected. Records every request."""
+    requests = []
+
+    def handle_one(self):
+        if self.headers.get("Transfer-Encoding") == "chunked":
+            body = b""
+            while size := int(self.rfile.readline().strip(), 16):
+                body += self.rfile.read(size)
+                self.rfile.readline()
+            self.rfile.readline()
+        else:
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        FakeMetricool.requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("X-Mc-Auth"), "body": json.loads(body) if body else None})
+        if self.headers.get("X-Mc-Auth") != "test-metricool-token":
+            return self.reply(401, {})
+        if self.path.startswith("/admin/simpleProfiles?"):
+            return self.reply(200, [{"id": 4242, "label": "Zapim in Metricool", "linkedinCompany": "zapim", "facebookPageId": "123", "instagram": None}])
+        if self.path.startswith("/v2/scheduler/posts?") and self.command == "POST":
+            return self.reply(200, {"data": {"id": 99}})
+        self.reply(404, {})
+
+    do_GET = do_POST = handle_one
+
+    def reply(self, code, data):
+        raw = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *args):
+        pass
+
+
 def main():
     global checks
-    with tempfile.TemporaryDirectory(prefix="zapim-tests-") as tmp:
-        env = dict(os.environ, ASPNETCORE_ENVIRONMENT="Development", ASPNETCORE_URLS=BASE, StoragePath=tmp, Publishing__Enabled="false", AI__ApiKey="", Bootstrap__Email="", Bootstrap__Password="", Logging__LogLevel__Default="Warning")
+    with tempfile.TemporaryDirectory(prefix="zapim-tests-", ignore_cleanup_errors=True) as tmp:
+        metricool = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeMetricool)
+        threading.Thread(target=metricool.serve_forever, daemon=True).start()
+        env = dict(os.environ, ASPNETCORE_ENVIRONMENT="Development", ASPNETCORE_URLS=BASE, StoragePath=tmp, Publishing__Enabled="false", AI__ApiKey="", Bootstrap__Email="", Bootstrap__Password="", Logging__LogLevel__Default="Warning",
+                   Metricool__BaseUrl=f"http://127.0.0.1:{metricool.server_port}", Metricool__UserToken="test-metricool-token", Metricool__UserId="777")
         if SQLSERVER:
             assert SQLCMD, "TEST_SQLCMD is required with TEST_SQLSERVER"
             env["ConnectionStrings__SqlServer"] = f"{SQLSERVER.rstrip(';')};Database={DATABASE}"
@@ -163,6 +204,16 @@ def main():
             protected = sql(tmp, "SELECT ProtectedToken FROM Accounts")
             check("test-token" not in protected and len(protected) > 40, "Social tokens are encrypted at rest")
             check(len(editor.call("/api/audit")) >= 4, "Review history is recorded")
+            check(s["metricoolConfigured"], "Session reports Metricool configuration")
+            editor.call(f'/api/brands/{a["id"]}/metricool', "PUT", {"blogId": "4242"}, expected=403)
+            admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "not-a-number"}, expected=400)
+            admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "5555"}, expected=400)
+            check(True, "Only admins can map a brand, and only to a Metricool brand that exists")
+            mapped = admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "4242"})
+            check(mapped["account"]["name"] == "Zapim in Metricool" and mapped["networks"] == ["LinkedIn", "Facebook"], "Mapping reads the Metricool brand and its connected networks")
+            check(admin.call(f'/api/brands/{a["id"]}/metricool')["account"] is None, "Metricool mapping is per brand")
+            check(all(r["auth"] == "test-metricool-token" and "blogId=4242" in r["path"] and "userId=777" in r["path"] for r in FakeMetricool.requests if "4242" in r["path"]), "Metricool calls carry the token header, userId and blogId")
+            via_metricool = admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Via Metricool"))
             anon = Client()
             anon.session()
             anon.call("/api/login", "POST", {}, expected=400)
@@ -173,6 +224,7 @@ def main():
             unverified = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Unverified", platform="Facebook"))
             sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(180)} WHERE Id={stale['id']}")
             sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={unverified['id']}")
+            sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={via_metricool['id']}")
             process.terminate()
             process.wait(timeout=10)
             env["Publishing__Enabled"] = "true"
@@ -183,11 +235,20 @@ def main():
             check(not persisted.session()["setupRequired"], "Setup remains closed after restart")
             for _ in range(60):
                 posts = {p["id"]: p for p in persisted.call("/api/posts")}
-                if posts[stale["id"]]["status"] != "Scheduled" and posts[unverified["id"]]["status"] != "Scheduled":
+                if all(posts[x["id"]]["status"] not in ("Scheduled", "Publishing") for x in (stale, unverified, via_metricool)):
                     break
                 time.sleep(.5)
             check(posts[stale["id"]]["status"] == "NeedsAttention" and "Nothing was sent" in posts[stale["id"]]["error"], "Overdue scheduled posts are not published late")
             check(posts[unverified["id"]]["status"] == "NeedsAttention" and "not been verified" in posts[unverified["id"]]["error"], "Unverified account tokens are never used to publish")
+            sent = posts[via_metricool["id"]]
+            check(sent["status"] == "Published" and sent["remoteId"] == "metricool:99", "A due post for a mapped brand is handed to Metricool")
+            created = [r for r in FakeMetricool.requests if r["method"] == "POST"]
+            check(len(created) == 1 and created[0]["body"]["providers"] == [{"network": "linkedin"}] and created[0]["body"]["text"] == "A caption to review" and created[0]["body"]["autoPublish"] is True, "Metricool receives the caption and the post's network")
+            instagram = persisted.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Instagram via Metricool", platform="Instagram", caption="Caption"))
+            instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "review", "version": instagram["version"]})
+            instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "approve", "version": instagram["version"]})
+            persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "publish", "version": instagram["version"]}, expected=400)
+            check(True, "Posts for a network not connected in Metricool cannot be scheduled")
             persisted.call("/api/logout", "POST")
             persisted.call("/api/posts", expected=401)
             check(True, "Sign-out removes access")
@@ -195,12 +256,13 @@ def main():
             process.terminate()
             process.wait(timeout=10)
             log.close()
+            metricool.shutdown()
             if SQLSERVER:
                 try:
                     sql(tmp, f"ALTER DATABASE [{DATABASE}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{DATABASE}]", database="master")
                 except subprocess.CalledProcessError as e:
                     print(f"WARNING: could not drop test database {DATABASE}: {e.stdout or e.stderr}", flush=True)
-    print(f"\n{checks} integration checks passed on {'SQL Server' if SQLSERVER else 'SQLite'}; no external publishing calls made.")
+    print(f"\n{checks} integration checks passed on {'SQL Server' if SQLSERVER else 'SQLite'}; no external publishing calls made (Metricool is simulated locally).")
 
 
 if __name__ == "__main__":

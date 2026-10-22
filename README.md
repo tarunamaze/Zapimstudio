@@ -44,6 +44,7 @@ dotnet user-secrets set 'Bootstrap:Password' 'A_UNIQUE_LONG_PASSWORD'
 | `AI__ApiKey` | Enables OpenAI copy and image generation. Without it, copy generation is explicitly labelled as a starter template. |
 | `AI__TextModel` | Configurable Responses API model. Default: `gpt-4.1-mini`. |
 | `AI__ImageModel` | Configurable image model supporting JPEG output. Default: `gpt-image-1`. |
+| `Metricool__UserToken`, `Metricool__UserId` | One Metricool account for all brands: its API token (Metricool → Account settings → API) and user ID. When both are set, brands mapped to a Metricool brand publish through Metricool. Requires a Metricool plan with API access (Advanced or Custom). |
 | `PublicBaseUrl` | Public HTTPS origin, e.g. `https://studio.example.com`, required for Meta image publishing. |
 | `Publishing__Enabled` | Default `false`. Set `true` only when live publication is intended. |
 | `Publishing__MetaVersion` | Graph API version, default `v25.0`; align with the version supported by your Meta app. |
@@ -54,6 +55,14 @@ dotnet user-secrets set 'Bootstrap:Password' 'A_UNIQUE_LONG_PASSWORD'
 The creative builder runs in the browser and produces a 1080×1080 JPEG without an AI key. The photo layout crops the chosen upload, asset or AI image to a square and darkens it so the headline stays legible; AI images requested for this layout ask for no text in the picture. AI calls require an account with model access and incur provider charges. Generated images and copy remain drafts until reviewed.
 
 ## Social connections
+
+### Through Metricool (recommended to start)
+
+With `Metricool__UserToken` and `Metricool__UserId` set on the server, an administrator selects a brand in **Accounts** and selects **Map Metricool brand**, then enters that brand's Metricool brand ID: the number after `blogId=` in the Metricool address bar. Each Zapim brand maps to one Metricool brand; the Metricool account and its token are shared by all brands. The mapping is checked against Metricool, and the card shows which of LinkedIn, Facebook and Instagram are connected to that Metricool brand.
+
+While a brand is mapped, its direct connections below are not used. A post can be scheduled only if its network is connected to the Metricool brand. When a scheduled post is due, the scheduler sends it to Metricool's planner for publication two minutes later (Metricool accepts only future times), with the creative as a public `/media/...` link that Metricool copies. The post becomes **Published** once Metricool accepts it and returns a post ID; the audit log records "Sent to Metricool". Metricool then publishes it, and delivery problems after that point are reported in Metricool, not in Zapim Studio. Removing the mapping is blocked while the brand has scheduled posts.
+
+### Direct platform tokens
 
 An administrator selects a brand in **Accounts**, adds a token, account identifier, label and expiry, then selects **Verify**. Tokens are encrypted using ASP.NET Core Data Protection. The API never returns plaintext or encrypted tokens to clients.
 

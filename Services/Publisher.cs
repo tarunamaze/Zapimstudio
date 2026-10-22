@@ -4,8 +4,14 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
 namespace Zapim.Marketing;
-public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db)
+public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db, MetricoolClient metricool)
 {
+    // Where a brand's post goes: its Metricool brand when Metricool is configured and mapped, otherwise its own platform account.
+    public static async Task<SocialAccount?> Destination(MarketingDb db, IConfiguration config, int brandId, string platform, CancellationToken ct = default)
+    {
+        if (MetricoolClient.Configured(config) && await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform, ct) is { } mapped) return mapped;
+        return await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == platform, ct);
+    }
     private HttpClient Client => factory.CreateClient("external");
     private string Token(SocialAccount a) => protection.CreateProtector("social-tokens-v1").Unprotect(a.ProtectedToken);
     private string Graph => $"https://graph.facebook.com/{config["Publishing:MetaVersion"]}";
@@ -26,6 +32,7 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
     }
     public async Task Verify(SocialAccount a)
     {
+        if (a.Platform == MetricoolClient.Platform) { a.Name = (await metricool.Brand(a.ExternalId)).Label; return; }
         Rules.Require(a.ExpiresAt > DateTime.UtcNow, "This access token has expired.");
         string url;
         if (a.Platform == "LinkedIn")
@@ -42,6 +49,11 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
         Rules.Require(a.VerifiedAt.HasValue, "The account token was replaced and has not been verified. Verify the account, then reschedule this post.");
         var image = post.AssetId.Length > 0 ? await db.Assets.FindAsync([post.AssetId], ct) : null;
         var mediaUrl = $"{config["PublicBaseUrl"]?.TrimEnd('/')}/media/{post.AssetId}";
+        if (a.Platform == MetricoolClient.Platform)
+        {
+            Rules.Require(post.Platform != "Instagram" || image?.ContentType == "image/jpeg", "Instagram requires a JPEG image.");
+            return "metricool:" + await metricool.Schedule(post, a.ExternalId, image is null ? null : mediaUrl, ct);
+        }
         if (a.Platform == "LinkedIn")
         {
             string? imageUrn = null;
@@ -127,7 +139,7 @@ public class PublishingWorker(IServiceScopeFactory scopes, IConfiguration config
                     var post = await db.Posts.FindAsync([p.Id], stoppingToken);
                     try
                     {
-                        var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == p.BrandId && x.Platform == p.Platform, stoppingToken) ?? throw new RuleException("Social account is disconnected.");
+                        var account = await Publisher.Destination(db, config, p.BrandId, p.Platform, stoppingToken) ?? throw new RuleException("Social account is disconnected.");
                         post!.RemoteId = await scope.ServiceProvider.GetRequiredService<Publisher>().Publish(post, account, stoppingToken);
                         post.Status = "Published"; post.PublishedAt = DateTime.UtcNow; post.Error = "";
                     }
@@ -138,7 +150,7 @@ public class PublishingWorker(IServiceScopeFactory scopes, IConfiguration config
                         logger.LogWarning("Post {Id} needs attention ({Type})", p.Id, e.GetType().Name);
                     }
                     post!.UpdatedAt = DateTime.UtcNow; post.Version++;
-                    db.Audit.Add(new AuditEntry { BrandId = post.BrandId, PostId = post.Id, Action = post.Status == "Published" ? "Published to " + post.Platform : "Delivery needs attention" });
+                    db.Audit.Add(new AuditEntry { BrandId = post.BrandId, PostId = post.Id, Action = post.Status != "Published" ? "Delivery needs attention" : post.RemoteId.StartsWith("metricool:") ? $"Sent to Metricool for {post.Platform}" : "Published to " + post.Platform });
                     await db.SaveChangesAsync(stoppingToken);
                 }
             }
