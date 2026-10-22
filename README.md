@@ -6,7 +6,7 @@ An internal multi-brand marketing portal built with ASP.NET Core 10, EF Core/SQL
 
 - Separate brand workspaces, brand voice, audience, colour and logo.
 - Cookie authentication; Admin, Approver and Editor roles; per-brand membership.
-- Content studio with platform-specific captions, brand-aware AI copy, an editable square creative builder, optional AI image generation, uploads, asset library and downloads.
+- Content studio with platform-specific captions, brand-aware AI copy, optional AI image generation, uploads, asset library and downloads. Each post chooses a visual: a brand-colour template, a photo with the headline, logo and website placed over it, an image posted as is, or no image for text-only LinkedIn and Facebook posts.
 - Draft → In review → Approved → Scheduled → Published workflow, change requests and audit history. Editing resets approval. Optimistic concurrency prevents stale edits or approvals.
 - Monthly content calendar in the browser's local timezone; server timestamps are UTC.
 - Durable scheduler and adapters for LinkedIn text/image posts, Facebook Page text/image posts and Instagram professional-account single-image posts.
@@ -50,7 +50,7 @@ dotnet user-secrets set 'Bootstrap:Password' 'A_UNIQUE_LONG_PASSWORD'
 | `Publishing__MaxLatenessMinutes` | Default `60`. A scheduled post that the scheduler reaches later than this (after downtime, or while publishing was disabled) is not sent; it becomes **Needs attention** so it can be rescheduled. |
 | `ASPNETCORE_FORWARDEDHEADERS_ENABLED` | Set `true` only behind a reverse proxy, so client IPs (login rate limiting) and HTTPS (HSTS) are read from `X-Forwarded-*`. Already set in `compose.yaml` and `render.yaml`. Do not set it when the app is directly reachable. |
 
-The creative builder runs in the browser and produces a 1080×1080 JPEG without an AI key. AI calls require an account with model access and incur provider charges. Generated images and copy remain drafts until reviewed.
+The creative builder runs in the browser and produces a 1080×1080 JPEG without an AI key. The photo layout crops the chosen upload, asset or AI image to a square and darkens it so the headline stays legible; AI images requested for this layout ask for no text in the picture. AI calls require an account with model access and incur provider charges. Generated images and copy remain drafts until reviewed.
 
 ## Social connections
 
