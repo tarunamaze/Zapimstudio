@@ -100,7 +100,9 @@ app.Use(async (ctx, next) =>
     }
 });
 if (!app.Environment.IsDevelopment()) app.UseHsts();
-app.UseDefaultFiles(); app.UseStaticFiles();
+app.UseDefaultFiles();
+// Revalidate on every load (a cheap 304 when unchanged) so browsers pick up a new deployment without a forced refresh.
+app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = f => f.Context.Response.Headers.CacheControl = "no-cache" });
 app.UseAuthentication(); app.UseAuthorization(); app.UseRateLimiter();
 app.Use(async (ctx, next) =>
 {
