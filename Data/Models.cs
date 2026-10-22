@@ -89,6 +89,10 @@ public class MarketingDb(DbContextOptions<MarketingDb> options) : DbContext(opti
     public DbSet<AuditEntry> Audit => Set<AuditEntry>();
     protected override void OnModelCreating(ModelBuilder b)
     {
+        // Indexed strings need a bounded length on SQL Server (nvarchar(max) cannot be an index key).
+        b.Entity<TeamUser>().Property(x => x.Email).HasMaxLength(254);
+        b.Entity<Post>().Property(x => x.Status).HasMaxLength(32);
+        b.Entity<SocialAccount>().Property(x => x.Platform).HasMaxLength(32);
         b.Entity<TeamUser>().HasIndex(x => x.Email).IsUnique();
         b.Entity<Membership>().HasKey(x => new { x.UserId, x.BrandId });
         b.Entity<TeamUser>().HasMany(x => x.Memberships).WithOne().HasForeignKey(x => x.UserId);

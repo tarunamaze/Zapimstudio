@@ -13,7 +13,13 @@ var storage = Path.GetFullPath(builder.Configuration["StoragePath"] ?? "App_Data
 Directory.CreateDirectory(storage);
 Directory.CreateDirectory(Path.Combine(storage, "assets"));
 builder.Services.AddSingleton(new Storage(storage));
-builder.Services.AddDbContext<MarketingDb>(o => o.UseSqlite($"Data Source={Path.Combine(storage, "marketing.db")}"));
+// SQL Server when a connection string is configured; otherwise a SQLite file in the storage directory.
+var sqlServer = builder.Configuration.GetConnectionString("SqlServer");
+builder.Services.AddDbContext<MarketingDb>(o =>
+{
+    if (string.IsNullOrWhiteSpace(sqlServer)) o.UseSqlite($"Data Source={Path.Combine(storage, "marketing.db")}");
+    else o.UseSqlServer(sqlServer);
+});
 builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(storage, "keys"))).SetApplicationName("ZapimMarketing");
 builder.Services.AddAntiforgery(o => o.HeaderName = "X-CSRF-TOKEN");
 builder.Services.AddSingleton<IPasswordHasher<TeamUser>, PasswordHasher<TeamUser>>();
@@ -114,7 +120,7 @@ app.MapPost("/api/setup", async (LoginInput input, MarketingDb db, IPasswordHash
 {
     Rules.Require(app.Environment.IsDevelopment(), "Set Bootstrap__Email and Bootstrap__Password on the server to create the first administrator.", 403);
     // Transaction serializes first-admin creation across concurrent requests.
-    await using var tx = await db.Database.BeginTransactionAsync();
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
     Rules.Require(!await db.Users.AnyAsync(), "Setup is already complete.", 409);
     Rules.ValidateLogin(input);
     var user = new TeamUser { Name = "Administrator", Email = input.Email.Trim().ToLowerInvariant(), Role = "Admin" };

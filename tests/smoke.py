@@ -1,11 +1,15 @@
 """Integration checks against a temporary database. Run after dotnet build.
 Overrides: DOTNET_EXECUTABLE, TEST_PORT (default 5097).
+SQL Server instead of SQLite: set TEST_SQLSERVER to a server connection string without a database
+(e.g. "Server=localhost;User Id=sa;Password=...;TrustServerCertificate=True") and TEST_SQLCMD to a sqlcmd
+command for the same server (e.g. "sqlcmd -S localhost -U sa -P ... -C"). A throwaway database is created and dropped.
 No external messages, provider calls or persistent workspace records are created.
 """
 import http.cookiejar
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -20,6 +24,9 @@ DOTNET = os.environ.get("DOTNET_EXECUTABLE", shutil.which("dotnet") or "/workspa
 PORT = int(os.environ.get("TEST_PORT", "5097"))
 BASE = f"http://127.0.0.1:{PORT}"
 PASSWORD = "test-only-password-5289!"
+SQLSERVER = os.environ.get("TEST_SQLSERVER", "")
+SQLCMD = shlex.split(os.environ.get("TEST_SQLCMD", ""))
+DATABASE = f"zapim_smoke_{os.getpid()}"
 checks = 0
 
 
@@ -60,6 +67,20 @@ class Client:
         return self.session()
 
 
+def sql(tmp, query, database=DATABASE):
+    """Run a query directly against the app database and return the first value, if any."""
+    if SQLSERVER:
+        out = subprocess.run(SQLCMD + ["-d", database, "-b", "-y", "0", "-Q", "SET NOCOUNT ON; " + query], capture_output=True, text=True, check=True).stdout.strip()
+        return out.splitlines()[0].strip() if out else ""
+    with sqlite3.connect(Path(tmp) / "marketing.db") as db:
+        rows = db.execute(query).fetchall()
+    return rows[0][0] if rows else ""
+
+
+def minutes_ago(n):
+    return f"DATEADD(minute, -{n}, SYSUTCDATETIME())" if SQLSERVER else f"datetime('now', '-{n} minutes')"
+
+
 def brand(name):
     return {"name": name, "website": "https://example.com", "color": "#087f76", "tone": "Helpful", "audience": "Teams", "description": "A test brand"}
 
@@ -68,6 +89,9 @@ def main():
     global checks
     with tempfile.TemporaryDirectory(prefix="zapim-tests-") as tmp:
         env = dict(os.environ, ASPNETCORE_ENVIRONMENT="Development", ASPNETCORE_URLS=BASE, StoragePath=tmp, Publishing__Enabled="false", AI__ApiKey="", Bootstrap__Email="", Bootstrap__Password="", Logging__LogLevel__Default="Warning")
+        if SQLSERVER:
+            assert SQLCMD, "TEST_SQLCMD is required with TEST_SQLSERVER"
+            env["ConnectionStrings__SqlServer"] = f"{SQLSERVER.rstrip(';')};Database={DATABASE}"
         log = open(Path(tmp) / "server.log", "w+")
         dll = ROOT / "bin/Debug/net10.0/Zapim.Marketing.dll"
         assert dll.exists(), "Run dotnet build first"
@@ -136,9 +160,8 @@ def main():
             account = admin.call(f'/api/brands/{a["id"]}/accounts', "POST", {"platform": "Facebook", "name": "Test only", "externalId": "123456789", "token": "test-token-never-used-externally", "expiresAt": "2035-01-01T00:00:00Z"})
             check("protectedToken" not in account and "token" not in account, "Account responses never expose tokens")
             check(all("protectedToken" not in x for x in editor.call(f'/api/brands/{a["id"]}/accounts')), "Account listing redacts secrets")
-            with sqlite3.connect(Path(tmp) / "marketing.db") as db:
-                protected = db.execute('SELECT ProtectedToken FROM Accounts LIMIT 1').fetchone()[0]
-                check("test-token" not in protected and len(protected) > 40, "Social tokens are encrypted at rest")
+            protected = sql(tmp, "SELECT ProtectedToken FROM Accounts")
+            check("test-token" not in protected and len(protected) > 40, "Social tokens are encrypted at rest")
             check(len(editor.call("/api/audit")) >= 4, "Review history is recorded")
             anon = Client()
             anon.session()
@@ -148,9 +171,8 @@ def main():
             # Seed scheduled posts directly; neither path below reaches a social API.
             stale = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Stale", platform="Facebook"))
             unverified = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Unverified", platform="Facebook"))
-            with sqlite3.connect(Path(tmp) / "marketing.db") as db:
-                db.execute("UPDATE Posts SET Status='Scheduled', ScheduledAt=datetime('now','-3 hours') WHERE Id=?", (stale["id"],))
-                db.execute("UPDATE Posts SET Status='Scheduled', ScheduledAt=datetime('now','-1 minutes') WHERE Id=?", (unverified["id"],))
+            sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(180)} WHERE Id={stale['id']}")
+            sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={unverified['id']}")
             process.terminate()
             process.wait(timeout=10)
             env["Publishing__Enabled"] = "true"
@@ -173,7 +195,12 @@ def main():
             process.terminate()
             process.wait(timeout=10)
             log.close()
-    print(f"\n{checks} integration checks passed; no external publishing calls made.")
+            if SQLSERVER:
+                try:
+                    sql(tmp, f"ALTER DATABASE [{DATABASE}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{DATABASE}]", database="master")
+                except subprocess.CalledProcessError as e:
+                    print(f"WARNING: could not drop test database {DATABASE}: {e.stdout or e.stderr}", flush=True)
+    print(f"\n{checks} integration checks passed on {'SQL Server' if SQLSERVER else 'SQLite'}; no external publishing calls made.")
 
 
 if __name__ == "__main__":
