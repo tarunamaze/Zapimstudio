@@ -7,8 +7,8 @@ What lives where on the server:
 | Location | Contents | Changed by deployments? |
 | --- | --- | --- |
 | The `zapimmarketing` site folder (e.g. `C:\inetpub\zapimmarketing`) | The published app and `web.config` | Yes |
-| `appsettings.Production.json` in the site folder | Connection string, admin bootstrap, AI key, publishing settings | No, server-only, never in Git |
-| `C:\ZapimMarketingData` | Uploaded images (`assets`) and the encryption key ring (`keys`) | No |
+| `appsettings.Production.json` in the site folder | Connection string, admin bootstrap, publishing settings | No, server-only, never in Git |
+| `C:\ZapimMarketingData` | Uploaded images (`assets`), the encryption key ring (`keys`), and the Metricool and OpenAI settings saved under **Settings** (encrypted) | No |
 | SQL Server database `ZapimMarketing` | All records | No (tables are created on first start) |
 
 ## 1. Prerequisites (once)
@@ -79,11 +79,12 @@ On first start the app creates its tables in `ZapimMarketing` and your administr
 1. Check `https://<host name>/health` returns `{"status":"ok"}`, and sign in.
 2. Remove the `Password` line under `Bootstrap` in `appsettings.Production.json` and recycle the `zapimmarketing` app pool.
 3. Connect Metricool (one account for all brands): sign in as an administrator, open **Settings**, and enter the Metricool user ID and API token. Then in **Accounts**, map each brand to its Metricool brand ID.
-4. Optional: add `AI.ApiKey`, and set `Publishing.Enabled` to `true` when you are ready for scheduled posts to go out. Recycle the app pool after each change.
+4. Optional: for AI captions and images, enter an OpenAI API key under **Settings**.
+5. Set `Publishing.Enabled` to `true` in `appsettings.Production.json` when you are ready for scheduled posts to go out, then recycle the app pool.
 
 ## Day-to-day
 
-- **Backups:** back up the `ZapimMarketing` database **and** `C:\ZapimMarketingData`. Without the `keys` folder, saved social tokens and the Metricool token cannot be decrypted and must be re-entered. Add the database to whatever backs up the HRMS databases.
+- **Backups:** back up the `ZapimMarketing` database **and** `C:\ZapimMarketingData`. Without the `keys` folder, saved social tokens, the Metricool token and the OpenAI key cannot be decrypted and must be re-entered. Add the database to whatever backs up the HRMS databases.
 - **Run one instance only.** Don't add the site to a web farm or a second server.
 - **Schema changes:** tables are created with `EnsureCreated`, which never alters existing tables. Future model changes need a migration plan before deploying.
 

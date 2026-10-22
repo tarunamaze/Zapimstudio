@@ -54,6 +54,7 @@ builder.Services.AddScoped<ContentService>();
 builder.Services.AddScoped<Publisher>();
 builder.Services.AddScoped<MetricoolClient>();
 builder.Services.AddSingleton<MetricoolSettings>();
+builder.Services.AddSingleton<OpenAiSettings>();
 builder.Services.AddHostedService<PublishingWorker>();
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
@@ -108,13 +109,13 @@ app.Use(async (ctx, next) =>
     await next();
 });
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery csrf, MetricoolSettings metricoolSettings) => new
+app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery csrf, MetricoolSettings metricoolSettings, OpenAiSettings openAiSettings) => new
 {
     csrfToken = csrf.GetAndStoreTokens(ctx).RequestToken,
     setupRequired = !await db.Users.AnyAsync(),
     setupAllowed = app.Environment.IsDevelopment(),
     user = ctx.User.Identity?.IsAuthenticated == true ? await db.Users.FindAsync(Rules.UserId(ctx)) : null,
-    aiEnabled = !string.IsNullOrWhiteSpace(builder.Configuration["AI:ApiKey"]),
+    aiEnabled = openAiSettings.Configured,
     publishingEnabled = builder.Configuration.GetValue<bool>("Publishing:Enabled"),
     publicMediaConfigured = !string.IsNullOrWhiteSpace(builder.Configuration["PublicBaseUrl"]),
     metricoolConfigured = metricoolSettings.Configured
@@ -221,6 +222,19 @@ api.MapPut("/settings/metricool", (MetricoolSettingsInput input, HttpContext ctx
     return MetricoolStatus(settings);
 });
 api.MapDelete("/settings/metricool", (HttpContext ctx, MetricoolSettings settings) => { Rules.Admin(ctx); settings.Clear(); return MetricoolStatus(settings); });
+object OpenAiStatus(OpenAiSettings s) => new
+{
+    configured = s.Configured, source = s.Source, updatedAt = s.UpdatedAt, textModel = s.Current?.TextModel ?? s.DefaultTextModel, imageModel = s.Current?.ImageModel ?? s.DefaultImageModel,
+    defaultTextModel = s.DefaultTextModel, defaultImageModel = s.DefaultImageModel
+};
+api.MapGet("/settings/openai", (HttpContext ctx, OpenAiSettings settings) => { Rules.Admin(ctx); return OpenAiStatus(settings); });
+api.MapPut("/settings/openai", async (OpenAiSettingsInput input, HttpContext ctx, OpenAiSettings settings) =>
+{
+    Rules.Admin(ctx); await settings.Save(input.ApiKey, input.TextModel, input.ImageModel);
+    app.Logger.LogInformation("OpenAI settings changed by user {UserId}", Rules.UserId(ctx));
+    return OpenAiStatus(settings);
+});
+api.MapDelete("/settings/openai", (HttpContext ctx, OpenAiSettings settings) => { Rules.Admin(ctx); settings.Clear(); return OpenAiStatus(settings); });
 api.MapGet("/brands/{brandId:int}/metricool", async (int brandId, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings settings) =>
 {
     await Rules.Brand(ctx, db, brandId);
@@ -311,6 +325,7 @@ public record PostInput(string Title, string Platform, string Caption, string As
 public record TransitionInput(string Action, int Version, DateTime? ScheduledAt = null, string Note = "");
 public record MetricoolInput(string BlogId);
 public record MetricoolSettingsInput(string UserId, string Token = "");
+public record OpenAiSettingsInput(string ApiKey = "", string TextModel = "", string ImageModel = "");
 public record AccountInput(string Platform, string Name, string ExternalId, string Token, DateTime ExpiresAt);
 public record GenerateInput(string Brief, string Platform = "LinkedIn");
 public record UserInput(string Name, string Email, string Password, string Role, int[] BrandIds);

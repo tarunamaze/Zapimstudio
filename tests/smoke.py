@@ -101,6 +101,10 @@ class FakeMetricool(http.server.BaseHTTPRequestHandler):
         else:
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         FakeMetricool.requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("X-Mc-Auth"), "body": json.loads(body) if body else None})
+        if self.path.startswith("/models/"):
+            if self.headers.get("Authorization") != "Bearer test-openai-key-0123456789":
+                return self.reply(401, {})
+            return self.reply(200 if self.path in ("/models/gpt-4.1-mini", "/models/gpt-image-1") else 404, {})
         if self.headers.get("X-Mc-Auth") != "test-metricool-token":
             return self.reply(401, {})
         if self.path.startswith("/admin/simpleProfiles?"):
@@ -129,7 +133,7 @@ def main():
         metricool = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeMetricool)
         threading.Thread(target=metricool.serve_forever, daemon=True).start()
         env = dict(os.environ, ASPNETCORE_ENVIRONMENT="Development", ASPNETCORE_URLS=BASE, StoragePath=tmp, Publishing__Enabled="false", AI__ApiKey="", Bootstrap__Email="", Bootstrap__Password="", Logging__LogLevel__Default="Warning",
-                   Metricool__BaseUrl=f"http://127.0.0.1:{metricool.server_port}", Metricool__UserToken="test-metricool-token", Metricool__UserId="777")
+                   Metricool__BaseUrl=f"http://127.0.0.1:{metricool.server_port}", AI__BaseUrl=f"http://127.0.0.1:{metricool.server_port}", Metricool__UserToken="test-metricool-token", Metricool__UserId="777")
         if SQLSERVER:
             assert SQLCMD, "TEST_SQLCMD is required with TEST_SQLSERVER"
             env["ConnectionStrings__SqlServer"] = f"{SQLSERVER.rstrip(';')};Database={DATABASE}"
@@ -215,6 +219,15 @@ def main():
             stored = (Path(tmp) / "metricool.json").read_text()
             check("test-metricool-token" not in stored and "777" in stored, "The Metricool token is encrypted at rest")
             check(admin.call("/api/settings/metricool", "PUT", {"userId": "777", "token": ""})["configured"], "A blank token keeps the saved token")
+            check(not admin.call("/api/settings/openai")["configured"], "OpenAI starts unconfigured")
+            editor.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789"}, expected=403)
+            admin.call("/api/settings/openai", "PUT", {"apiKey": "wrong-openai-key-0123456789"}, expected=400)
+            admin.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789", "textModel": "no-such-model"}, expected=400)
+            check(not admin.call("/api/settings/openai")["configured"], "A rejected key or unavailable model is never saved")
+            ai = admin.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789"})
+            check(ai["configured"] and ai["textModel"] == "gpt-4.1-mini" and "test-openai-key" not in json.dumps(ai), "A checked OpenAI key is saved and never returned")
+            check("test-openai-key" not in (Path(tmp) / "openai.json").read_text() and admin.session()["aiEnabled"], "The OpenAI key is encrypted at rest and enables AI")
+            check(not admin.call("/api/settings/openai", "DELETE")["configured"] and not admin.session()["aiEnabled"], "Removing the OpenAI key disables AI")
             editor.call(f'/api/brands/{a["id"]}/metricool', "PUT", {"blogId": "4242"}, expected=403)
             admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "not-a-number"}, expected=400)
             admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "5555"}, expected=400)

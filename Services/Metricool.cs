@@ -8,25 +8,11 @@ namespace Zapim.Marketing;
 public record MetricoolBrand(string BlogId, string Label, string[] Networks);
 public record MetricoolCredentials(string UserId, string Token);
 
-// The one Metricool account used by all brands. Saved from the Settings page into the storage directory, with the token
-// encrypted like social tokens; otherwise read from server configuration (Metricool:UserId, Metricool:UserToken).
+// The one Metricool account used by all brands; otherwise read from server configuration (Metricool:UserId, Metricool:UserToken).
+public record MetricoolSaved(string UserId, string ProtectedToken, DateTime UpdatedAt);
 public class MetricoolSettings(IConfiguration config, Storage storage, IDataProtectionProvider protection)
+    : SavedSettings<MetricoolSaved>(storage, protection, "metricool.json", "metricool-token-v1")
 {
-    private record Saved(string UserId, string ProtectedToken, DateTime UpdatedAt);
-    private readonly Lock gate = new();
-    private Saved? saved;
-    private bool loaded;
-    private string FilePath => Path.Combine(storage.Root, "metricool.json");
-    private IDataProtector Protector => protection.CreateProtector("metricool-token-v1");
-
-    private Saved? Load()
-    {
-        lock (gate)
-        {
-            if (!loaded) { saved = File.Exists(FilePath) ? JsonSerializer.Deserialize<Saved>(File.ReadAllText(FilePath)) : null; loaded = true; }
-            return saved;
-        }
-    }
     public string Source => Load() is not null ? "app" : FromConfig() is not null ? "server" : "";
     public DateTime? UpdatedAt => Load()?.UpdatedAt;
     private MetricoolCredentials? FromConfig() =>
@@ -41,13 +27,8 @@ public class MetricoolSettings(IConfiguration config, Storage storage, IDataProt
         token = token.Trim();
         if (token == "") token = Current?.Token ?? "";
         Rules.Require(token.Length is >= 10 and <= 4000, "Enter the Metricool API token from Metricool, Account settings, API.");
-        lock (gate)
-        {
-            saved = new Saved(userId, Protector.Protect(token), DateTime.UtcNow); loaded = true;
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(saved));
-        }
+        Write(new MetricoolSaved(userId, Protector.Protect(token), DateTime.UtcNow));
     }
-    public void Clear() { lock (gate) { File.Delete(FilePath); saved = null; loaded = true; } }
 }
 
 // Each Zapim brand maps to one Metricool brand (blogId), stored as the brand's SocialAccount with Platform "Metricool".

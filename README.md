@@ -41,9 +41,9 @@ dotnet user-secrets set 'Bootstrap:Password' 'A_UNIQUE_LONG_PASSWORD'
 | `StoragePath` | Persistent directory containing SQLite, images and keys. |
 | `ConnectionStrings__SqlServer` | Use SQL Server instead of SQLite. Point it at a dedicated, empty database; tables are created on first start. |
 | `Bootstrap__Email`, `Bootstrap__Password` | Create the first administrator if no users exist. Required for first production startup; remove after initialization. Password minimum: 12 characters. |
-| `AI__ApiKey` | Enables OpenAI copy and image generation. Without it, copy generation is explicitly labelled as a starter template. |
-| `AI__TextModel` | Configurable Responses API model. Default: `gpt-4.1-mini`. |
-| `AI__ImageModel` | Configurable image model supporting JPEG output. Default: `gpt-image-1`. |
+| `AI__ApiKey` | Optional. The OpenAI key is normally entered by an administrator under **Settings**, which checks it with OpenAI and stores it encrypted in `openai.json` in the storage directory; this is used only until a key has been saved there. Without a key, copy generation is explicitly labelled as a starter template. |
+| `AI__TextModel` | Default Responses API model, which **Settings** can override. Default: `gpt-4.1-mini`. |
+| `AI__ImageModel` | Default image model supporting JPEG output, which **Settings** can override. Default: `gpt-image-1`. |
 | `Metricool__UserToken`, `Metricool__UserId` | Optional. The Metricool account is normally entered by an administrator under **Settings**; these are used only until it has been saved there. |
 | `PublicBaseUrl` | Public HTTPS origin, e.g. `https://studio.example.com`, required for Meta image publishing. |
 | `Publishing__Enabled` | Default `false`. Set `true` only when live publication is intended. |
