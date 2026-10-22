@@ -53,6 +53,7 @@ builder.Services.AddHttpClient("external", c => c.Timeout = TimeSpan.FromMinutes
 builder.Services.AddScoped<ContentService>();
 builder.Services.AddScoped<Publisher>();
 builder.Services.AddScoped<MetricoolClient>();
+builder.Services.AddSingleton<MetricoolSettings>();
 builder.Services.AddHostedService<PublishingWorker>();
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
@@ -107,7 +108,7 @@ app.Use(async (ctx, next) =>
     await next();
 });
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery csrf) => new
+app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery csrf, MetricoolSettings metricoolSettings) => new
 {
     csrfToken = csrf.GetAndStoreTokens(ctx).RequestToken,
     setupRequired = !await db.Users.AnyAsync(),
@@ -116,7 +117,7 @@ app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery 
     aiEnabled = !string.IsNullOrWhiteSpace(builder.Configuration["AI:ApiKey"]),
     publishingEnabled = builder.Configuration.GetValue<bool>("Publishing:Enabled"),
     publicMediaConfigured = !string.IsNullOrWhiteSpace(builder.Configuration["PublicBaseUrl"]),
-    metricoolConfigured = MetricoolClient.Configured(builder.Configuration)
+    metricoolConfigured = metricoolSettings.Configured
 });
 app.MapPost("/api/setup", async (LoginInput input, MarketingDb db, IPasswordHasher<TeamUser> hasher) =>
 {
@@ -168,7 +169,7 @@ api.MapPut("/posts/{id:int}", async (int id, PostInput input, HttpContext ctx, M
     await Rules.ValidatePost(input, post.BrandId, db); Rules.ApplyPost(post, input); post.Status = "Draft"; post.ApprovedBy = null; post.Version++; post.UpdatedAt = DateTime.UtcNow;
     db.Audit.Add(new AuditEntry { BrandId = post.BrandId, PostId = id, UserId = Rules.UserId(ctx), Action = "Edited; approval reset" }); await db.SaveChangesAsync(); return post;
 });
-api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, HttpContext ctx, MarketingDb db, MetricoolClient metricool) =>
+api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings metricoolSettings) =>
 {
     var post = await Rules.Post(ctx, db, id); Rules.Require(input.Version == post.Version, "This post changed. Refresh and try again.", 409);
     var old = post.Status;
@@ -182,7 +183,7 @@ api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, 
         case "publish":
             Rules.Approver(ctx); Rules.Require(old == "Approved", "Only approved posts can be published.");
             Rules.Require(builder.Configuration.GetValue<bool>("Publishing:Enabled"), "Live publishing is disabled. Enable Publishing__Enabled on the server after configuring accounts.");
-            var account = await Publisher.Destination(db, builder.Configuration, post.BrandId, post.Platform);
+            var account = await Publisher.Destination(db, metricoolSettings, post.BrandId, post.Platform);
             var scheduled = input.Action == "publish" ? DateTime.UtcNow : input.ScheduledAt?.ToUniversalTime();
             Rules.Require(scheduled.HasValue && (input.Action == "publish" || scheduled > DateTime.UtcNow), "Choose a future date and time.");
             Rules.Require(account is not null && account.VerifiedAt.HasValue && account.ExpiresAt > scheduled, "Map this brand to Metricool, or connect and verify an account with a token valid through the publish time.");
@@ -211,19 +212,28 @@ api.MapPost("/brands/{brandId:int}/accounts", async (int brandId, AccountInput i
     account.ProtectedToken = protection.CreateProtector("social-tokens-v1").Protect(input.Token);
     await db.SaveChangesAsync(); return account;
 });
-api.MapGet("/brands/{brandId:int}/metricool", async (int brandId, HttpContext ctx, MarketingDb db, MetricoolClient metricool) =>
+object MetricoolStatus(MetricoolSettings s) => new { configured = s.Configured, source = s.Source, userId = s.Current?.UserId ?? "", updatedAt = s.UpdatedAt };
+api.MapGet("/settings/metricool", (HttpContext ctx, MetricoolSettings settings) => { Rules.Admin(ctx); return MetricoolStatus(settings); });
+api.MapPut("/settings/metricool", (MetricoolSettingsInput input, HttpContext ctx, MetricoolSettings settings) =>
+{
+    Rules.Admin(ctx); settings.Save(input.UserId.Trim(), input.Token);
+    app.Logger.LogInformation("Metricool settings changed by user {UserId}", Rules.UserId(ctx));
+    return MetricoolStatus(settings);
+});
+api.MapDelete("/settings/metricool", (HttpContext ctx, MetricoolSettings settings) => { Rules.Admin(ctx); settings.Clear(); return MetricoolStatus(settings); });
+api.MapGet("/brands/{brandId:int}/metricool", async (int brandId, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings settings) =>
 {
     await Rules.Brand(ctx, db, brandId);
-    var configured = MetricoolClient.Configured(builder.Configuration);
+    var configured = settings.Configured;
     var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform);
     if (!configured || account is null) return Results.Ok(new { configured, account, networks = (string[]?)null, error = "" });
     try { return Results.Ok(new { configured, account, networks = (string[]?)(await metricool.Brand(account.ExternalId)).Networks, error = "" }); }
     catch (RuleException e) { return Results.Ok(new { configured, account, networks = (string[]?)null, error = e.Message }); }
 });
-api.MapPut("/brands/{brandId:int}/metricool", async (int brandId, MetricoolInput input, HttpContext ctx, MarketingDb db, MetricoolClient metricool) =>
+api.MapPut("/brands/{brandId:int}/metricool", async (int brandId, MetricoolInput input, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings settings) =>
 {
     Rules.Admin(ctx); await Rules.Brand(ctx, db, brandId);
-    Rules.Require(MetricoolClient.Configured(builder.Configuration), "Set Metricool:UserToken and Metricool:UserId in the server settings first.");
+    Rules.Require(settings.Configured, "Add the Metricool user ID and API token under Settings first.");
     Rules.Require(System.Text.RegularExpressions.Regex.IsMatch(input.BlogId, "^[0-9]{1,18}$"), "Enter the numeric Metricool brand ID (the blogId in the Metricool address bar).");
     var remote = await metricool.Brand(input.BlogId);
     var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform) ?? new SocialAccount { BrandId = brandId, Platform = MetricoolClient.Platform };
@@ -300,6 +310,7 @@ public record BrandInput(string Name, string Website, string Color, string Tone,
 public record PostInput(string Title, string Platform, string Caption, string AssetId = "", int Version = 0);
 public record TransitionInput(string Action, int Version, DateTime? ScheduledAt = null, string Note = "");
 public record MetricoolInput(string BlogId);
+public record MetricoolSettingsInput(string UserId, string Token = "");
 public record AccountInput(string Platform, string Name, string ExternalId, string Token, DateTime ExpiresAt);
 public record GenerateInput(string Brief, string Platform = "LinkedIn");
 public record UserInput(string Name, string Email, string Password, string Role, int[] BrandIds);

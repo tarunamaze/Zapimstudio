@@ -78,18 +78,12 @@ On first start the app creates its tables in `ZapimMarketing` and your administr
 
 1. Check `https://<host name>/health` returns `{"status":"ok"}`, and sign in.
 2. Remove the `Password` line under `Bootstrap` in `appsettings.Production.json` and recycle the `zapimmarketing` app pool.
-3. Connect Metricool (one account for all brands). This adds the Metricool token, which it asks for without displaying it, and user ID to `appsettings.Production.json` and restarts the app (elevated PowerShell on the server):
-
-   ```powershell
-   $f='C:\inetpub\wwwroot\zapimmarketing\appsettings.Production.json'; $j=Get-Content $f -Raw | ConvertFrom-Json; $t=[Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR((Read-Host 'Metricool API token' -AsSecureString))); $j | Add-Member -Force Metricool ([pscustomobject]@{ UserToken = $t; UserId = (Read-Host 'Metricool user ID') }); $j | ConvertTo-Json -Depth 5 | Set-Content $f -Encoding UTF8; Restart-WebAppPool zapimmarketing
-   ```
-
-   Then in **Accounts**, map each brand to its Metricool brand ID.
+3. Connect Metricool (one account for all brands): sign in as an administrator, open **Settings**, and enter the Metricool user ID and API token. Then in **Accounts**, map each brand to its Metricool brand ID.
 4. Optional: add `AI.ApiKey`, and set `Publishing.Enabled` to `true` when you are ready for scheduled posts to go out. Recycle the app pool after each change.
 
 ## Day-to-day
 
-- **Backups:** back up the `ZapimMarketing` database **and** `C:\ZapimMarketingData`. Without the `keys` folder, saved social tokens cannot be decrypted and must be re-entered. Add the database to whatever backs up the HRMS databases.
+- **Backups:** back up the `ZapimMarketing` database **and** `C:\ZapimMarketingData`. Without the `keys` folder, saved social tokens and the Metricool token cannot be decrypted and must be re-entered. Add the database to whatever backs up the HRMS databases.
 - **Run one instance only.** Don't add the site to a web farm or a second server.
 - **Schema changes:** tables are created with `EnsureCreated`, which never alters existing tables. Future model changes need a migration plan before deploying.
 

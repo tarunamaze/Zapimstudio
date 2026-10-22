@@ -7,9 +7,9 @@ namespace Zapim.Marketing;
 public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db, MetricoolClient metricool)
 {
     // Where a brand's post goes: its Metricool brand when Metricool is configured and mapped, otherwise its own platform account.
-    public static async Task<SocialAccount?> Destination(MarketingDb db, IConfiguration config, int brandId, string platform, CancellationToken ct = default)
+    public static async Task<SocialAccount?> Destination(MarketingDb db, MetricoolSettings metricool, int brandId, string platform, CancellationToken ct = default)
     {
-        if (MetricoolClient.Configured(config) && await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform, ct) is { } mapped) return mapped;
+        if (metricool.Configured && await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform, ct) is { } mapped) return mapped;
         return await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == platform, ct);
     }
     private HttpClient Client => factory.CreateClient("external");
@@ -139,7 +139,7 @@ public class PublishingWorker(IServiceScopeFactory scopes, IConfiguration config
                     var post = await db.Posts.FindAsync([p.Id], stoppingToken);
                     try
                     {
-                        var account = await Publisher.Destination(db, config, p.BrandId, p.Platform, stoppingToken) ?? throw new RuleException("Social account is disconnected.");
+                        var account = await Publisher.Destination(db, scope.ServiceProvider.GetRequiredService<MetricoolSettings>(), p.BrandId, p.Platform, stoppingToken) ?? throw new RuleException("Social account is disconnected.");
                         post!.RemoteId = await scope.ServiceProvider.GetRequiredService<Publisher>().Publish(post, account, stoppingToken);
                         post.Status = "Published"; post.PublishedAt = DateTime.UtcNow; post.Error = "";
                     }
