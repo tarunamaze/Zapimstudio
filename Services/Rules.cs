@@ -39,8 +39,9 @@ public static class Rules
         var limit = i.Platform == "Instagram" ? 2200 : i.Platform == "LinkedIn" ? 3000 : 63206;
         Require(!string.IsNullOrWhiteSpace(i.Caption) && i.Caption.Length <= limit, $"Add a caption under {limit:N0} characters.");
         if (i.AssetId != "") Require(await db.Assets.AnyAsync(a => a.Id == i.AssetId && a.BrandId == brandId), "Choose an asset belonging to this brand.");
+        Require(i.SuggestedAt is null || (i.SuggestedAt > DateTime.UtcNow.AddYears(-1) && i.SuggestedAt < DateTime.UtcNow.AddYears(2)), "Choose a suggested publish time within the next two years.");
     }
-    public static void ApplyPost(Post p, PostInput i) { p.Title = i.Title.Trim(); p.Platform = i.Platform; p.Caption = i.Caption.Trim(); p.AssetId = i.AssetId; }
+    public static void ApplyPost(Post p, PostInput i) { p.Title = i.Title.Trim(); p.Platform = i.Platform; p.Caption = i.Caption.Trim(); p.AssetId = i.AssetId; p.ScheduledAt = i.SuggestedAt?.ToUniversalTime(); }
     public static bool PublicUrl(IConfiguration c) => Uri.TryCreate(c["PublicBaseUrl"], UriKind.Absolute, out var uri) && uri.Scheme == "https" && !uri.IsLoopback;
 }
 public class Storage(string root)

@@ -7,8 +7,10 @@ An internal multi-brand marketing portal built with ASP.NET Core 10, EF Core (SQ
 - Separate brand workspaces, brand voice, audience, colour and logo.
 - Cookie authentication; Admin, Approver and Editor roles; per-brand membership.
 - Content studio with platform-specific captions, brand-aware AI copy, optional AI image generation, uploads, asset library and downloads. Each post chooses a visual: a brand-colour template, a photo with the headline, logo and website placed over it, an image posted as is, or no image for text-only LinkedIn and Facebook posts.
+- **Plan with AI:** give a goal (or none), a start date, 1–4 weeks, posts per week and channels. The AI proposes a dated content calendar from the brand context: pillar, channel, day and local time, caption, creative headline and eyebrow, visual (brand graphic, AI photo or text only) and a one-line rationale per post. Everything is editable; selected posts become drafts with their creatives drawn automatically (AI photos optional, billed per image) and their suggested publish time, optionally sent straight to review. Approval is still required before scheduling, and the schedule dialog is prefilled with the suggested time.
+- **Create with AI:** for a single post, the AI picks the topic if the brief is blank, writes the copy, chooses the visual and headline, generates the photo when it fits and recommends when to post.
 - Draft → In review → Approved → Scheduled → Published workflow, change requests and audit history. Editing resets approval. Optimistic concurrency prevents stale edits or approvals.
-- Monthly content calendar in the browser's local timezone; server timestamps are UTC.
+- Monthly content calendar in the browser's local timezone, showing scheduled posts and planned drafts (dashed); server timestamps are UTC.
 - Durable scheduler and adapters for LinkedIn text/image posts, Facebook Page text/image posts and Instagram professional-account single-image posts.
 - Encrypted social tokens, account verification, expiry validation, publishing failure visibility and no automatic retry after uncertain delivery.
 - Team management, operational reporting and CSV export. Reports contain real portal activity, not sample engagement numbers.
@@ -127,7 +129,7 @@ The smoke suite creates a temporary database and runs the compiled application o
 - Engagement/attribution data is not fetched. Reports cover portal workflow and confirmed publishing only.
 - The app needs configured AI credentials and social app access before those external features can be tested end to end. No social posts were sent during development.
 - User-supplied JPEG/PNG signatures and file size are checked; a production media pipeline should additionally decode, normalize and strip metadata from uploaded images.
-- Brand colour is configurable. The initial design is a proposed Zapim Studio visual identity; substitute your approved brand assets and typography as needed.
+- The interface follows zapim.com: royal blue `#0038C9`, the site's blue button gradient and violet-to-pink accent, Plus Jakarta Sans headings and Inter body text (self-hosted in `wwwroot/fonts`, SIL Open Font License). The starter Zapim brand is created with context written from zapim.com (`Services/ZapimContext.cs`), including the published figures the AI may quote; edit it under Brands at any time.
 
 ## API references
 

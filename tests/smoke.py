@@ -7,6 +7,7 @@ No external messages, provider calls or persistent workspace records are created
 """
 import http.cookiejar
 import http.server
+import datetime
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,22 @@ class FakeMetricool(http.server.BaseHTTPRequestHandler):
             if self.headers.get("Authorization") != "Bearer test-openai-key-0123456789":
                 return self.reply(401, {})
             return self.reply(200 if self.path in ("/models/gpt-4.1-mini", "/models/gpt-image-1") else 404, {})
+        if self.path == "/responses" and self.command == "POST":
+            if self.headers.get("Authorization") != "Bearer test-openai-key-0123456789":
+                return self.reply(401, {})
+            request = FakeMetricool.requests[-1]["body"]
+            data = json.loads(request["input"])
+            if request["text"]["format"]["name"] == "content_plan":
+                start = datetime.date.fromisoformat(data["startDate"])
+                post = {"time": "09:30", "pillar": "Channel explainers", "title": "What is RCS?", "caption": "RCS explained.", "creativeHeadline": "Texts that act like apps", "kicker": "rcs explained", "layout": "editorial", "imagePrompt": "", "rationale": "Mid-week reach."}
+                result = {"summary": "Two explainers.", "posts": [
+                    dict(post, date=str(start), platform="LinkedIn"),
+                    dict(post, date=str(start + datetime.timedelta(days=2)), platform="LinkedIn", layout="sculpture", time="7pm"),
+                    dict(post, date=str(start + datetime.timedelta(days=1)), platform="Instagram"),
+                    dict(post, date=str(start + datetime.timedelta(days=30)), platform="LinkedIn")]}
+            else:
+                result = {"title": "Picked by AI", "caption": "A caption.", "creativeHeadline": "One platform", "kicker": "every channel", "layout": "none", "imagePrompt": "An office.", "time": "18:00", "rationale": "Evening reach."}
+            return self.reply(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(result)}]}]})
         if self.headers.get("X-Mc-Auth") != "test-metricool-token":
             return self.reply(401, {})
         if self.path.startswith("/admin/simpleProfiles?"):
@@ -227,7 +244,33 @@ def main():
             ai = admin.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789"})
             check(ai["configured"] and ai["textModel"] == "gpt-4.1-mini" and "test-openai-key" not in json.dumps(ai), "A checked OpenAI key is saved and never returned")
             check("test-openai-key" not in (Path(tmp) / "openai.json").read_text() and admin.session()["aiEnabled"], "The OpenAI key is encrypted at rest and enables AI")
+            plan_start = str(datetime.date.today() + datetime.timedelta(days=1))
+            plan_input = {"startDate": plan_start, "weeks": 1, "postsPerWeek": 2, "platforms": ["LinkedIn"], "goal": "", "timeZone": "Asia/Kolkata"}
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, weeks=5), expected=400)
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, platforms=[]), expected=400)
+            editor.call(f'/api/brands/{b["id"]}/plan', "POST", plan_input, expected=404)
+            check(True, "Plans are validated and limited to the user's brands")
+            plan = editor.call(f'/api/brands/{a["id"]}/plan', "POST", plan_input)
+            check([x["date"] for x in plan["posts"]] == [plan_start, str(datetime.date.fromisoformat(plan_start) + datetime.timedelta(days=2))] and all(x["platform"] == "LinkedIn" for x in plan["posts"]), "Plans keep only posts on the chosen channels and dates")
+            check(plan["posts"][1]["layout"] == "editorial" and plan["posts"][1]["time"] == "10:00" and plan["posts"][0]["kicker"] == "RCS EXPLAINED", "Invalid AI layouts and times fall back to safe defaults")
+            sent = [r["body"] for r in FakeMetricool.requests if r["path"] == "/responses"][-1]
+            check("CPaaS" in sent["input"] or "Brand A" in sent["input"], "The plan request carries the brand context")
+            picked = editor.call(f'/api/brands/{a["id"]}/generate', "POST", {"brief": "", "platform": "Instagram"})
+            check(picked["title"] == "Picked by AI" and picked["layout"] == "editorial" and picked["time"] == "18:00", "AI can pick the topic, and never chooses text-only for Instagram")
             check(not admin.call("/api/settings/openai", "DELETE")["configured"] and not admin.session()["aiEnabled"], "Removing the OpenAI key disables AI")
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", plan_input, expected=400)
+            check(True, "Planning without an OpenAI key is refused clearly")
+            soon = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            planned = editor.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Planned", suggestedAt=soon))
+            check(planned["status"] == "Draft" and planned["scheduledAt"].startswith(soon[:16]), "A draft keeps its suggested publish time without being scheduled")
+            planned = editor.call(f'/api/posts/{planned["id"]}', "PUT", dict(payload, title="Planned", version=planned["version"]))
+            check(planned["scheduledAt"] is None, "Saving without a suggested time clears it")
+            editor.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, suggestedAt="2099-01-01T00:00:00Z"), expected=400)
+            check(True, "Suggested times are bounded")
+            zapim = next(x for x in admin.call("/api/brands") if x["name"] == "Zapim")
+            check("CPaaS" in zapim["description"] and zapim["color"] == "#0038C9" and len(zapim["description"]) <= 3000 and len(zapim["tone"]) <= 1000 and len(zapim["audience"]) <= 1000, "New workspaces start with the full Zapim context, within the brand form's limits")
+            admin.call(f'/api/brands/{zapim["id"]}', "PUT", {k: zapim[k] for k in ("name", "website", "color", "tone", "audience", "description", "logoAssetId")})
+            check(True, "The Zapim context can be saved again from the brand form")
             editor.call(f'/api/brands/{a["id"]}/metricool', "PUT", {"blogId": "4242"}, expected=403)
             admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "not-a-number"}, expected=400)
             admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "5555"}, expected=400)
@@ -248,6 +291,8 @@ def main():
             sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(180)} WHERE Id={stale['id']}")
             sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={unverified['id']}")
             sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={via_metricool['id']}")
+            sql(tmp, "UPDATE Brands SET Description='Business communication through WhatsApp, SMS, RCS, voice and email. Campaigns, support and transactional messaging in one platform.', Color='#087f76' WHERE Name='Zapim'")
+            sql(tmp, "UPDATE Brands SET Description='Edited by the team.' WHERE Name='Brand A'")
             process.terminate()
             process.wait(timeout=10)
             env["Publishing__Enabled"] = "true"
@@ -256,6 +301,9 @@ def main():
             persisted.login("admin@example.com")
             check(any(p["caption"] == "Revised copy" for p in persisted.call("/api/posts")), "Drafts survive application restart")
             check(not persisted.session()["setupRequired"], "Setup remains closed after restart")
+            upgraded = {x["name"]: x for x in persisted.call("/api/brands")}
+            check("CPaaS" in upgraded["Zapim"]["description"] and upgraded["Zapim"]["color"] == "#0038C9", "An unedited starter Zapim brand is upgraded to the full context")
+            check(upgraded["Brand A"]["description"] == "Edited by the team.", "Edited brands are never overwritten")
             for _ in range(60):
                 posts = {p["id"]: p for p in persisted.call("/api/posts")}
                 if all(posts[x["id"]]["status"] not in ("Scheduled", "Publishing") for x in (stale, unverified, via_metricool)):
@@ -265,7 +313,7 @@ def main():
             check(posts[unverified["id"]]["status"] == "NeedsAttention" and "not been verified" in posts[unverified["id"]]["error"], "Unverified account tokens are never used to publish")
             sent = posts[via_metricool["id"]]
             check(sent["status"] == "Published" and sent["remoteId"] == "metricool:99", "A due post for a mapped brand is handed to Metricool")
-            created = [r for r in FakeMetricool.requests if r["method"] == "POST"]
+            created = [r for r in FakeMetricool.requests if r["method"] == "POST" and r["path"].startswith("/v2/scheduler/posts")]
             check(len(created) == 1 and created[0]["body"]["providers"] == [{"network": "linkedin"}] and created[0]["body"]["text"] == "A caption to review" and created[0]["body"]["autoPublish"] is True, "Metricool receives the caption and the post's network")
             instagram = persisted.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Instagram via Metricool", platform="Instagram", caption="Caption"))
             instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "review", "version": instagram["version"]})

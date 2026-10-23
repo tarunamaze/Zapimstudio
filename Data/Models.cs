@@ -8,7 +8,7 @@ public class Brand
     public int Id { get; set; }
     public string Name { get; set; } = "";
     public string Website { get; set; } = "";
-    public string Color { get; set; } = "#087f76";
+    public string Color { get; set; } = "#0038C9";
     public string Tone { get; set; } = "Clear, confident and helpful";
     public string Audience { get; set; } = "";
     public string Description { get; set; } = "";

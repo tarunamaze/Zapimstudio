@@ -71,12 +71,21 @@ using (var scope = app.Services.CreateScope())
     }
     if (!await db.Brands.AnyAsync())
     {
-        var brand = new Brand { Name = "Zapim", Website = "https://zapim.com", Color = "#087f76", Audience = "Marketing, customer experience and product leaders at Indian businesses", Description = "Business communication through WhatsApp, SMS, RCS, voice and email. Campaigns, support and transactional messaging in one platform.", Tone = "Confident, helpful, practical. Explain business outcomes clearly; avoid unsupported statistics." };
+        var brand = new Brand { Name = "Zapim", Website = ZapimContext.Website, Color = ZapimContext.Color, Audience = ZapimContext.Audience, Description = ZapimContext.Description, Tone = ZapimContext.Tone };
         db.Brands.Add(brand); await db.SaveChangesAsync();
         db.Posts.AddRange(
             new Post { BrandId = brand.Id, Title = "One conversation. Every channel.", Platform = "LinkedIn", Caption = "Your customers move between channels. Your team should be able to follow the conversation.\n\nExplore WhatsApp, SMS, RCS, voice and email with Zapim.\n\nSee how it works: https://zapim.com/request-demo\n\n#CustomerExperience #BusinessMessaging #Zapim", ReviewNote = "Starter draft — review product claims before publishing." },
             new Post { BrandId = brand.Id, Title = "Turn questions into conversations", Platform = "Instagram", Caption = "A product question is the start of a conversation. Make it easy for shoppers to get an answer on WhatsApp.\n\nDiscover Zapim at the link in your bio.\n\n#WhatsAppBusiness #Ecommerce #Zapim", ReviewNote = "Starter draft — add a creative and review before publishing." },
             new Post { BrandId = brand.Id, Title = "A better way to follow up", Platform = "Facebook", Caption = "Keep customers informed with timely order updates and helpful follow-ups. Discover business messaging with Zapim.\n\nhttps://zapim.com/request-demo", ReviewNote = "Starter draft — review before publishing." });
+        await db.SaveChangesAsync();
+    }
+    // Give the starter Zapim brand its full context, unless someone has already edited it.
+    foreach (var starter in await db.Brands.Where(b => b.Name == "Zapim" && b.Description == ZapimContext.StarterDescription).ToListAsync())
+    {
+        starter.Description = ZapimContext.Description;
+        if (starter.Audience == ZapimContext.StarterAudience) starter.Audience = ZapimContext.Audience;
+        if (starter.Tone == ZapimContext.StarterTone) starter.Tone = ZapimContext.Tone;
+        if (starter.Color == ZapimContext.StarterColor) starter.Color = ZapimContext.Color;
         await db.SaveChangesAsync();
     }
     // Never silently retry an interrupted publish: the remote service may have accepted it.
@@ -290,7 +299,11 @@ app.MapGet("/media/{id}", async (string id, MarketingDb db, Storage files) =>
 });
 api.MapPost("/brands/{brandId:int}/generate", async (int brandId, GenerateInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
 {
-    var brand = await Rules.Brand(ctx, db, brandId); Rules.Platform(input.Platform); Rules.Require(input.Brief.Length is > 5 and <= 4000, "Enter a brief between 6 and 4,000 characters."); return await service.Generate(brand, input);
+    var brand = await Rules.Brand(ctx, db, brandId); Rules.Platform(input.Platform); Rules.Require(input.Brief.Length <= 4000, "Keep the brief under 4,000 characters."); return await service.Generate(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/plan", async (int brandId, PlanInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Plan(brand, input);
 }).RequireRateLimiting("ai");
 api.MapPost("/brands/{brandId:int}/generate-image", async (int brandId, GenerateInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
 {
@@ -324,7 +337,9 @@ app.Run();
 
 public record LoginInput(string Email, string Password);
 public record BrandInput(string Name, string Website, string Color, string Tone, string Audience, string Description, string LogoAssetId = "");
-public record PostInput(string Title, string Platform, string Caption, string AssetId = "", int Version = 0);
+// SuggestedAt is the AI's (or the author's) proposed publish time for a draft; scheduling still needs approval.
+public record PostInput(string Title, string Platform, string Caption, string AssetId = "", int Version = 0, DateTime? SuggestedAt = null);
+public record PlanInput(string StartDate, int Weeks, int PostsPerWeek, string[] Platforms, string Goal = "", string TimeZone = "");
 public record TransitionInput(string Action, int Version, DateTime? ScheduledAt = null, string Note = "");
 public record MetricoolInput(string BlogId);
 public record MetricoolSettingsInput(string UserId, string Token = "");
