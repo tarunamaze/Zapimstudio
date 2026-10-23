@@ -88,6 +88,7 @@ using (var scope = app.Services.CreateScope())
         if (starter.Color == ZapimContext.StarterColor) starter.Color = ZapimContext.Color;
         await db.SaveChangesAsync();
     }
+    await BrandPresets.Ensure(db);
     // Never silently retry an interrupted publish: the remote service may have accepted it.
     await db.Posts.Where(x => x.Status == "Publishing").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "NeedsAttention").SetProperty(x => x.Error, "Publishing was interrupted. Check the social profile for duplicates before creating a replacement draft."));
 }

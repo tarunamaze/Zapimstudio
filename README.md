@@ -129,7 +129,7 @@ The smoke suite creates a temporary database and runs the compiled application o
 - Engagement/attribution data is not fetched. Reports cover portal workflow and confirmed publishing only.
 - The app needs configured AI credentials and social app access before those external features can be tested end to end. No social posts were sent during development.
 - User-supplied JPEG/PNG signatures and file size are checked; a production media pipeline should additionally decode, normalize and strip metadata from uploaded images.
-- The interface follows zapim.com: royal blue `#0038C9`, the site's blue button gradient and violet-to-pink accent, Plus Jakarta Sans headings and Inter body text (self-hosted in `wwwroot/fonts`, SIL Open Font License). The starter Zapim brand is created with context written from zapim.com (`Services/ZapimContext.cs`), including the published figures the AI may quote; edit it under Brands at any time.
+- The interface follows zapim.com: royal blue `#0038C9`, the site's blue button gradient and violet-to-pink accent, Plus Jakarta Sans headings and Inter body text (self-hosted in `wwwroot/fonts`, SIL Open Font License). The starter Zapim brand is created with context written from zapim.com (`Services/ZapimContext.cs`), including the published figures the AI may quote; edit it under Brands at any time. Vesper Telecom and Welco Infotech are added the same way from their websites (`Services/BrandPresets.cs`): each is created once at startup if no brand with its website or name exists, and is never recreated or overwritten.
 
 ## API references
 

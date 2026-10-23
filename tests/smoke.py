@@ -271,6 +271,11 @@ def main():
             check("CPaaS" in zapim["description"] and zapim["color"] == "#0038C9" and len(zapim["description"]) <= 3000 and len(zapim["tone"]) <= 1000 and len(zapim["audience"]) <= 1000, "New workspaces start with the full Zapim context, within the brand form's limits")
             admin.call(f'/api/brands/{zapim["id"]}', "PUT", {k: zapim[k] for k in ("name", "website", "color", "tone", "audience", "description", "logoAssetId")})
             check(True, "The Zapim context can be saved again from the brand form")
+            presets = {x["name"]: x for x in admin.call("/api/brands")}
+            check(all(n in presets and len(presets[n]["description"]) <= 3000 and len(presets[n]["tone"]) <= 1000 and len(presets[n]["audience"]) <= 1000 for n in ("Vesper Telecom", "Welco Infotech")), "Vesper Telecom and Welco Infotech are added, within the brand form's limits")
+            vesper = presets["Vesper Telecom"]
+            admin.call(f'/api/brands/{vesper["id"]}', "PUT", dict({k: vesper[k] for k in ("website", "color", "tone", "audience", "description", "logoAssetId")}, name="Vesper"))
+            check(True, "A preset brand can be renamed and saved from the brand form")
             editor.call(f'/api/brands/{a["id"]}/metricool', "PUT", {"blogId": "4242"}, expected=403)
             admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "not-a-number"}, expected=400)
             admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "5555"}, expected=400)
@@ -304,6 +309,7 @@ def main():
             upgraded = {x["name"]: x for x in persisted.call("/api/brands")}
             check("CPaaS" in upgraded["Zapim"]["description"] and upgraded["Zapim"]["color"] == "#0038C9", "An unedited starter Zapim brand is upgraded to the full context")
             check(upgraded["Brand A"]["description"] == "Edited by the team.", "Edited brands are never overwritten")
+            check("Vesper Telecom" not in upgraded and "Vesper" in upgraded and sum(1 for x in upgraded.values() if "welcoinfotech" in x["website"]) == 1, "Preset brands are created once and never recreated after a rename")
             for _ in range(60):
                 posts = {p["id"]: p for p in persisted.call("/api/posts")}
                 if all(posts[x["id"]]["status"] not in ("Scheduled", "Publishing") for x in (stale, unverified, via_metricool)):
