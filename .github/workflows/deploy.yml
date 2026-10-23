@@ -1,0 +1,75 @@
+name: Test and deploy
+
+# Runs only for pushes to main and manual runs, never for pull requests: the deploy job uses a
+# self-hosted runner on the production server, which must never execute code from a fork.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Ci-Only-Throwaway-7319!
+        ports:
+          - 1433:1433
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet build
+      - run: node --check wwwroot/app.js
+      - name: Smoke tests (SQLite)
+        run: python3 tests/smoke.py
+      - name: Wait for SQL Server
+        env:
+          SQLCMD: docker exec ${{ job.services.mssql.id }} /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Ci-Only-Throwaway-7319! -C
+        run: |
+          for i in $(seq 30); do $SQLCMD -Q "SELECT 1" -b >/dev/null 2>&1 && exit 0; sleep 2; done
+          echo "SQL Server did not start"; exit 1
+      - name: Smoke tests (SQL Server)
+        env:
+          TEST_SQLSERVER: Server=127.0.0.1,1433;User Id=sa;Password=Ci-Only-Throwaway-7319!;TrustServerCertificate=True
+          TEST_SQLCMD: docker exec ${{ job.services.mssql.id }} /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Ci-Only-Throwaway-7319! -C
+        run: python3 tests/smoke.py
+
+  deploy:
+    needs: test
+    if: github.repository == 'tarunamaze/Zapimstudio'
+    runs-on: [self-hosted, windows]
+    environment: production
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        env:
+          # Install the SDK where the runner's service account can write, not into Program Files.
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}\dotnet
+        with:
+          dotnet-version: 10.0.x
+      - name: Publish
+        run: dotnet publish Zapim.Marketing.csproj -c Release -o "${{ runner.temp }}\zapim-publish"
+      - name: Deploy to IIS
+        shell: powershell
+        run: |
+          if (-not $env:SITE_PATH) { throw 'Set the ZAPIM_SITE_PATH repository variable (see deploy/iis/README.md).' }
+          & .\deploy\iis\deploy.ps1 -Source "${{ runner.temp }}\zapim-publish" -SitePath $env:SITE_PATH -HealthUrl $env:HEALTH_URL
+        env:
+          SITE_PATH: ${{ vars.ZAPIM_SITE_PATH }}
+          HEALTH_URL: ${{ vars.ZAPIM_HEALTH_URL }}

@@ -9,6 +9,8 @@ services:
     envVars:
       - key: ASPNETCORE_ENVIRONMENT
         value: Production
+      - key: ASPNETCORE_FORWARDEDHEADERS_ENABLED
+        value: "true"
       - key: ASPNETCORE_HTTP_PORTS
         value: "8080"
       - key: StoragePath

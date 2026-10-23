@@ -1,15 +1,23 @@
 """Integration checks against a temporary database. Run after dotnet build.
 Overrides: DOTNET_EXECUTABLE, TEST_PORT (default 5097).
+SQL Server instead of SQLite: set TEST_SQLSERVER to a server connection string without a database
+(e.g. "Server=localhost;User Id=sa;Password=...;TrustServerCertificate=True") and TEST_SQLCMD to a sqlcmd
+command for the same server (e.g. "sqlcmd -S localhost -U sa -P ... -C"). A throwaway database is created and dropped.
 No external messages, provider calls or persistent workspace records are created.
 """
 import http.cookiejar
+import http.server
+import datetime
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,6 +27,9 @@ DOTNET = os.environ.get("DOTNET_EXECUTABLE", shutil.which("dotnet") or "/workspa
 PORT = int(os.environ.get("TEST_PORT", "5097"))
 BASE = f"http://127.0.0.1:{PORT}"
 PASSWORD = "test-only-password-5289!"
+SQLSERVER = os.environ.get("TEST_SQLSERVER", "")
+SQLCMD = shlex.split(os.environ.get("TEST_SQLCMD", ""))
+DATABASE = f"zapim_smoke_{os.getpid()}"
 checks = 0
 
 
@@ -48,6 +59,18 @@ class Client:
         assert response.code == expected, f"{method} {path}: expected {expected}, got {response.code}: {raw[:500]}"
         return json.loads(raw) if raw else {}
 
+    def upload(self, path, filename, data, content_type, expected=200):
+        boundary = "zapim-test-boundary"
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(BASE + path, body, {"Content-Type": f"multipart/form-data; boundary={boundary}", "X-CSRF-TOKEN": self.token}, method="POST")
+        try:
+            response = self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as e:
+            response = e
+        raw = response.read()
+        assert response.code == expected, f"upload {path}: expected {expected}, got {response.code}: {raw[:300]}"
+        return json.loads(raw) if raw else {}
+
     def session(self):
         s = self.call("/api/session")
         self.token = s["csrfToken"]
@@ -59,14 +82,99 @@ class Client:
         return self.session()
 
 
+def sql(tmp, query, database=DATABASE):
+    """Run a query directly against the app database and return the first value, if any."""
+    if SQLSERVER:
+        out = subprocess.run(SQLCMD + ["-d", database, "-b", "-y", "0", "-Q", "SET NOCOUNT ON; " + query], capture_output=True, text=True, check=True).stdout.strip()
+        return out.splitlines()[0].strip() if out else ""
+    with sqlite3.connect(Path(tmp) / "marketing.db") as db:
+        rows = db.execute(query).fetchall()
+    return rows[0][0] if rows else ""
+
+
+def minutes_ago(n):
+    return f"DATEADD(minute, -{n}, SYSUTCDATETIME())" if SQLSERVER else f"datetime('now', '-{n} minutes')"
+
+
 def brand(name):
     return {"name": name, "website": "https://example.com", "color": "#087f76", "tone": "Helpful", "audience": "Teams", "description": "A test brand"}
 
 
+class FakeMetricool(http.server.BaseHTTPRequestHandler):
+    """Stands in for app.metricool.com: one brand (4242) with LinkedIn and Facebook connected. Records every request."""
+    requests = []
+
+    def handle_one(self):
+        if self.headers.get("Transfer-Encoding") == "chunked":
+            body = b""
+            while size := int(self.rfile.readline().strip(), 16):
+                body += self.rfile.read(size)
+                self.rfile.readline()
+            self.rfile.readline()
+        else:
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        FakeMetricool.requests.append({"method": self.command, "path": self.path, "auth": self.headers.get("X-Mc-Auth"), "body": json.loads(body) if body else None})
+        if self.path.startswith("/models/"):
+            if self.headers.get("Authorization") != "Bearer test-openai-key-0123456789":
+                return self.reply(401, {})
+            return self.reply(200 if self.path in ("/models/gpt-4.1-mini", "/models/gpt-image-1") else 404, {})
+        if self.path == "/responses" and self.command == "POST":
+            if self.headers.get("Authorization") != "Bearer test-openai-key-0123456789":
+                return self.reply(401, {})
+            request = FakeMetricool.requests[-1]["body"]
+            data = json.loads(request["input"])
+            if request["text"]["format"]["name"] == "content_plan" and "dates" in data:
+                wrong = {"date": "2000-01-01", "platform": "Instagram", "time": "11:15", "pillar": "Picked", "title": "Dated post", "caption": "On the day.", "creativeHeadline": "Today", "kicker": "today", "layout": "editorial", "slides": [], "imagePrompt": "", "rationale": "Because."}
+                result = {"summary": "One per date.", "posts": [wrong for _ in data["dates"]]}
+            elif request["text"]["format"]["name"] == "content_plan":
+                start = datetime.date.fromisoformat(data["startDate"])
+                post = {"time": "09:30", "pillar": "Channel explainers", "title": "What is RCS?", "caption": "RCS explained.", "creativeHeadline": "Texts that act like apps", "kicker": "rcs explained", "layout": "editorial", "slides": [], "imagePrompt": "", "rationale": "Mid-week reach."}
+                slides = [{"headline": f"Slide {n}", "body": "Body"} for n in range(1, 4)]
+                result = {"summary": "Two explainers.", "posts": [
+                    dict(post, date=str(start), platform="LinkedIn", layout="carousel", slides=slides),
+                    dict(post, date=str(start + datetime.timedelta(days=2)), platform="LinkedIn", layout="sculpture", time="7pm"),
+                    dict(post, date=str(start + datetime.timedelta(days=1)), platform="Instagram"),
+                    dict(post, date=str(start + datetime.timedelta(days=30)), platform="LinkedIn")]}
+            elif request["text"]["format"]["name"] == "carousel":
+                result = {"title": "Five steps", "caption": "Swipe through.", "slides": [{"headline": f"Step {n}", "body": "Do this."} for n in range(1, 6)]}
+            elif request["text"]["format"]["name"] == "seo_article":
+                result = {"title": "AI voice agents for collections", "metaDescription": "How AI voice agents help lenders collect on time.", "slug": "AI Voice Agents: Collections!", "primaryKeyword": "ai voice agent",
+                          "secondaryKeywords": ["collections", "nbfc"], "body": "## Why it matters\n\n" + "Lenders call borrowers every day. " * 40, "faq": [{"question": "Is it multilingual?", "answer": "Yes."}]}
+            else:
+                result = {"title": "Picked by AI", "caption": "A caption.", "creativeHeadline": "One platform", "kicker": "every channel", "layout": "none", "imagePrompt": "An office.", "time": "18:00", "rationale": "Evening reach."}
+            return self.reply(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(result)}]}]})
+        if self.headers.get("X-Mc-Auth") != "test-metricool-token":
+            return self.reply(401, {})
+        if self.path.startswith("/admin/simpleProfiles?"):
+            return self.reply(200, [{"id": 4242, "label": "Zapim in Metricool", "linkedinCompany": "zapim", "facebookPageId": "123", "instagram": None}])
+        if self.path.startswith("/v2/scheduler/posts?") and self.command == "POST":
+            return self.reply(200, {"data": {"id": 99}})
+        self.reply(404, {})
+
+    do_GET = do_POST = handle_one
+
+    def reply(self, code, data):
+        raw = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *args):
+        pass
+
+
 def main():
     global checks
-    with tempfile.TemporaryDirectory(prefix="zapim-tests-") as tmp:
-        env = dict(os.environ, ASPNETCORE_ENVIRONMENT="Development", ASPNETCORE_URLS=BASE, StoragePath=tmp, Publishing__Enabled="false", AI__ApiKey="", Bootstrap__Email="", Bootstrap__Password="", Logging__LogLevel__Default="Warning")
+    with tempfile.TemporaryDirectory(prefix="zapim-tests-", ignore_cleanup_errors=True) as tmp:
+        metricool = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeMetricool)
+        threading.Thread(target=metricool.serve_forever, daemon=True).start()
+        env = dict(os.environ, ASPNETCORE_ENVIRONMENT="Development", ASPNETCORE_URLS=BASE, StoragePath=tmp, Publishing__Enabled="false", AI__ApiKey="", Bootstrap__Email="", Bootstrap__Password="", Logging__LogLevel__Default="Warning",
+                   Metricool__BaseUrl=f"http://127.0.0.1:{metricool.server_port}", AI__BaseUrl=f"http://127.0.0.1:{metricool.server_port}", Metricool__UserToken="test-metricool-token", Metricool__UserId="777")
+        if SQLSERVER:
+            assert SQLCMD, "TEST_SQLCMD is required with TEST_SQLSERVER"
+            env["ConnectionStrings__SqlServer"] = f"{SQLSERVER.rstrip(';')};Database={DATABASE}"
         log = open(Path(tmp) / "server.log", "w+")
         dll = ROOT / "bin/Debug/net10.0/Zapim.Marketing.dll"
         assert dll.exists(), "Run dotnet build first"
@@ -135,18 +243,148 @@ def main():
             account = admin.call(f'/api/brands/{a["id"]}/accounts', "POST", {"platform": "Facebook", "name": "Test only", "externalId": "123456789", "token": "test-token-never-used-externally", "expiresAt": "2035-01-01T00:00:00Z"})
             check("protectedToken" not in account and "token" not in account, "Account responses never expose tokens")
             check(all("protectedToken" not in x for x in editor.call(f'/api/brands/{a["id"]}/accounts')), "Account listing redacts secrets")
-            import sqlite3
-            with sqlite3.connect(Path(tmp) / "marketing.db") as db:
-                protected = db.execute('SELECT ProtectedToken FROM Accounts LIMIT 1').fetchone()[0]
-                check("test-token" not in protected and len(protected) > 40, "Social tokens are encrypted at rest")
+            protected = sql(tmp, "SELECT ProtectedToken FROM Accounts")
+            check("test-token" not in protected and len(protected) > 40, "Social tokens are encrypted at rest")
             check(len(editor.call("/api/audit")) >= 4, "Review history is recorded")
+            check(s["metricoolConfigured"], "Session reports Metricool configuration")
+            check(admin.call("/api/settings/metricool")["source"] == "server", "Metricool settings fall back to server configuration")
+            editor.call("/api/settings/metricool", expected=403)
+            editor.call("/api/settings/metricool", "PUT", {"userId": "777", "token": "test-metricool-token"}, expected=403)
+            admin.call("/api/settings/metricool", "PUT", {"userId": "abc", "token": "test-metricool-token"}, expected=400)
+            check(True, "Only admins can read or change Metricool settings, and the user ID is validated")
+            saved = admin.call("/api/settings/metricool", "PUT", {"userId": "777", "token": "test-metricool-token"})
+            check(saved["source"] == "app" and "token" not in json.dumps(saved).lower().replace('"token"', ''), "Metricool settings saved from the app never return the token")
+            stored = (Path(tmp) / "metricool.json").read_text()
+            check("test-metricool-token" not in stored and "777" in stored, "The Metricool token is encrypted at rest")
+            check(admin.call("/api/settings/metricool", "PUT", {"userId": "777", "token": ""})["configured"], "A blank token keeps the saved token")
+            check(not admin.call("/api/settings/openai")["configured"], "OpenAI starts unconfigured")
+            editor.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789"}, expected=403)
+            admin.call("/api/settings/openai", "PUT", {"apiKey": "wrong-openai-key-0123456789"}, expected=400)
+            admin.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789", "textModel": "no-such-model"}, expected=400)
+            check(not admin.call("/api/settings/openai")["configured"], "A rejected key or unavailable model is never saved")
+            ai = admin.call("/api/settings/openai", "PUT", {"apiKey": "test-openai-key-0123456789"})
+            check(ai["configured"] and ai["textModel"] == "gpt-4.1-mini" and "test-openai-key" not in json.dumps(ai), "A checked OpenAI key is saved and never returned")
+            check("test-openai-key" not in (Path(tmp) / "openai.json").read_text() and admin.session()["aiEnabled"], "The OpenAI key is encrypted at rest and enables AI")
+            plan_start = str(datetime.date.today() + datetime.timedelta(days=1))
+            plan_input = {"startDate": plan_start, "weeks": 1, "postsPerWeek": 2, "platforms": ["LinkedIn"], "goal": "", "timeZone": "Asia/Kolkata"}
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, weeks=5), expected=400)
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, platforms=[]), expected=400)
+            editor.call(f'/api/brands/{b["id"]}/plan', "POST", plan_input, expected=404)
+            check(True, "Plans are validated and limited to the user's brands")
+            plan = editor.call(f'/api/brands/{a["id"]}/plan', "POST", plan_input)
+            check([x["date"] for x in plan["posts"]] == [plan_start, str(datetime.date.fromisoformat(plan_start) + datetime.timedelta(days=2))] and all(x["platform"] == "LinkedIn" for x in plan["posts"]), "Plans keep only posts on the chosen channels and dates")
+            check(plan["posts"][1]["layout"] == "editorial" and plan["posts"][1]["time"] == "10:00" and plan["posts"][0]["kicker"] == "RCS EXPLAINED", "Invalid AI layouts and times fall back to safe defaults")
+            sent = [r["body"] for r in FakeMetricool.requests if r["path"] == "/responses"][-1]
+            check("CPaaS" in sent["input"] or "Brand A" in sent["input"], "The plan request carries the brand context")
+            picked = editor.call(f'/api/brands/{a["id"]}/generate', "POST", {"brief": "", "platform": "Instagram"})
+            check(picked["title"] == "Picked by AI" and picked["layout"] == "editorial" and picked["time"] == "18:00", "AI can pick the topic, and never chooses text-only for Instagram")
+            check(plan["posts"][0]["layout"] == "carousel" and len(plan["posts"][0]["slides"]) == 3, "Plans can propose LinkedIn carousels with their slides")
+            day1 = str(datetime.date.today() + datetime.timedelta(days=5)); day2 = str(datetime.date.today() + datetime.timedelta(days=9))
+            dated_input = dict(plan_input, dates=[{"date": day1, "platform": "LinkedIn", "note": "Webinar launch"}, {"date": day2, "platform": "Google", "note": ""}])
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, dates=[{"date": "2020-01-01", "platform": "LinkedIn", "note": ""}]), expected=400)
+            editor.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, dates=[{"date": day1, "platform": "Myspace", "note": ""}]), expected=400)
+            check(True, "Specific dates must be current and on a known channel")
+            dated = editor.call(f'/api/brands/{a["id"]}/plan', "POST", dated_input)
+            check([(x["date"], x["platform"], x["pillar"]) for x in dated["posts"]] == [(day1, "LinkedIn", "Webinar launch"), (day2, "Google", "Picked")] and dated["posts"][0]["time"] == "11:15", "A plan on specific dates keeps each chosen date and channel, with the AI's time")
+            reviewer.session()
+            repurpose = {"startDate": plan_start, "platforms": ["LinkedIn"], "posts": 2}
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="http://example.com/blog"), expected=400)
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="https://other.org/blog"), expected=400)
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="https://example.com:8443/blog"), expected=400)
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, text="Too short."), expected=400)
+            check(True, "Repurposing only reads https pages on the brand's own site, and needs real source text")
+            series = reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, text="Lenders call borrowers every day. " * 20, title="Collections"))
+            check(len(series["posts"]) == 2 and all(x["platform"] == "LinkedIn" for x in series["posts"]), "An article becomes dated posts on the chosen channels")
+            carousel = reviewer.call(f'/api/brands/{a["id"]}/carousel', "POST", {"brief": "Collections", "slides": 5})
+            check(len(carousel["slides"]) == 5 and carousel["title"] == "Five steps", "AI writes carousel slides")
+            article = reviewer.call(f'/api/brands/{a["id"]}/article', "POST", {"topic": "Collections", "keyword": "", "words": 1200})
+            check(article["slug"] == "ai-voice-agents-collections" and article["words"] > 100 and article["faq"][0]["question"], "AI writes SEO articles with a clean slug and FAQ")
+            check(not admin.call("/api/settings/openai", "DELETE")["configured"] and not admin.session()["aiEnabled"], "Removing the OpenAI key disables AI")
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", plan_input, expected=400)
+            check(True, "Planning without an OpenAI key is refused clearly")
+            soon = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            planned = editor.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Planned", suggestedAt=soon))
+            check(planned["status"] == "Draft" and planned["scheduledAt"].startswith(soon[:16]), "A draft keeps its suggested publish time without being scheduled")
+            planned = editor.call(f'/api/posts/{planned["id"]}', "PUT", dict(payload, title="Planned", version=planned["version"]))
+            check(planned["scheduledAt"] is None, "Saving without a suggested time clears it")
+            editor.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, suggestedAt="2099-01-01T00:00:00Z"), expected=400)
+            check(True, "Suggested times are bounded")
+            zapim = next(x for x in admin.call("/api/brands") if x["name"] == "Zapim")
+            check("CPaaS" in zapim["description"] and zapim["color"] == "#0038C9" and len(zapim["description"]) <= 3000 and len(zapim["tone"]) <= 1000 and len(zapim["audience"]) <= 1000, "New workspaces start with the full Zapim context, within the brand form's limits")
+            admin.call(f'/api/brands/{zapim["id"]}', "PUT", {k: zapim[k] for k in ("name", "website", "color", "tone", "audience", "description", "logoAssetId")})
+            check(True, "The Zapim context can be saved again from the brand form")
+            presets = {x["name"]: x for x in admin.call("/api/brands")}
+            check(all(n in presets and len(presets[n]["description"]) <= 3000 and len(presets[n]["tone"]) <= 1000 and len(presets[n]["audience"]) <= 1000 for n in ("Vesper Telecom", "Welco Infotech")), "Vesper Telecom and Welco Infotech are added, within the brand form's limits")
+            vesper = presets["Vesper Telecom"]
+            admin.call(f'/api/brands/{vesper["id"]}', "PUT", dict({k: vesper[k] for k in ("website", "color", "tone", "audience", "description", "logoAssetId")}, name="Vesper"))
+            check(True, "A preset brand can be renamed and saved from the brand form")
+            editor.call(f'/api/brands/{a["id"]}/metricool', "PUT", {"blogId": "4242"}, expected=403)
+            admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "not-a-number"}, expected=400)
+            admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "5555"}, expected=400)
+            check(True, "Only admins can map a brand, and only to a Metricool brand that exists")
+            mapped = admin.call(f'/api/brands/{b["id"]}/metricool', "PUT", {"blogId": "4242"})
+            check(mapped["account"]["name"] == "Zapim in Metricool" and mapped["networks"] == ["LinkedIn", "Facebook"], "Mapping reads the Metricool brand and its connected networks")
+            check(admin.call(f'/api/brands/{a["id"]}/metricool')["account"] is None, "Metricool mapping is per brand")
+            check(all(r["auth"] == "test-metricool-token" and "blogId=4242" in r["path"] and "userId=777" in r["path"] for r in FakeMetricool.requests if "4242" in r["path"]), "Metricool calls carry the token header, userId and blogId")
+            links = admin.call("/api/settings/links")
+            check(links["enabled"] and links["medium"] == "social", "Link tracking is on by default")
+            editor.call("/api/settings/links", "PUT", {"enabled": False, "medium": ""}, expected=403)
+            admin.call("/api/settings/links", "PUT", {"enabled": True, "medium": "bad medium!"}, expected=400)
+            check(True, "Only admins change link tracking, and the medium is validated")
+            tracked = "Read https://example.com/demo, then https://www.example.com/a?x=1#top and https://other.org/x"
+            via_metricool = admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Via Metricool", caption=tracked))
+            admin.call(f'/api/brands/{b["id"]}/accounts', "POST", {"platform": "Google", "name": "x", "externalId": "1", "token": "never-used-token", "expiresAt": "2035-01-01T00:00:00Z"}, expected=400)
+            admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, platform="Google", caption="x" * 1501), expected=400)
+            check(admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Local post", platform="Google"))["platform"] == "Google", "Google Business posts are drafted, through Metricool only, within 1,500 characters")
+            pdf = admin.upload(f'/api/brands/{b["id"]}/assets', "carousel.pdf", b"%PDF-1.4\n1 0 obj\n<< >>\nendobj\n%%EOF\n", "application/pdf")
+            check(pdf["contentType"] == "application/pdf", "PDF carousels can be uploaded")
+            admin.upload(f'/api/brands/{b["id"]}/assets', "fake.pdf", b"not a pdf at all", "application/pdf", expected=400)
+            admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, platform="Facebook", assetId=pdf["id"]), expected=400)
+            deck = admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Deck", assetId=pdf["id"]))
+            check(next(x for x in admin.call("/api/posts") if x["id"] == deck["id"])["assetType"] == "application/pdf", "PDF carousels post to LinkedIn only and are labelled in listings")
+            anon = Client()
+            anon.session()
+            anon.call("/api/login", "POST", {}, expected=400)
+            anon.call("/api/login", "POST", {"email": None, "password": PASSWORD}, expected=400)
+            check(True, "Missing or null JSON fields return 400, not 500")
+            # Seed scheduled posts directly; neither path below reaches a social API.
+            stale = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Stale", platform="Facebook"))
+            unverified = admin.call(f'/api/brands/{a["id"]}/posts', "POST", dict(payload, title="Unverified", platform="Facebook"))
+            sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(180)} WHERE Id={stale['id']}")
+            sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={unverified['id']}")
+            sql(tmp, f"UPDATE Posts SET Status='Scheduled', ScheduledAt={minutes_ago(1)} WHERE Id={via_metricool['id']}")
+            sql(tmp, "UPDATE Brands SET Description='Business communication through WhatsApp, SMS, RCS, voice and email. Campaigns, support and transactional messaging in one platform.', Color='#087f76' WHERE Name='Zapim'")
+            sql(tmp, "UPDATE Brands SET Description='Edited by the team.' WHERE Name='Brand A'")
             process.terminate()
             process.wait(timeout=10)
+            env["Publishing__Enabled"] = "true"
             process = start()
             persisted = Client()
             persisted.login("admin@example.com")
             check(any(p["caption"] == "Revised copy" for p in persisted.call("/api/posts")), "Drafts survive application restart")
             check(not persisted.session()["setupRequired"], "Setup remains closed after restart")
+            upgraded = {x["name"]: x for x in persisted.call("/api/brands")}
+            check("CPaaS" in upgraded["Zapim"]["description"] and upgraded["Zapim"]["color"] == "#0038C9", "An unedited starter Zapim brand is upgraded to the full context")
+            check(upgraded["Brand A"]["description"] == "Edited by the team.", "Edited brands are never overwritten")
+            check("Vesper Telecom" not in upgraded and "Vesper" in upgraded and sum(1 for x in upgraded.values() if "welcoinfotech" in x["website"]) == 1, "Preset brands are created once and never recreated after a rename")
+            for _ in range(60):
+                posts = {p["id"]: p for p in persisted.call("/api/posts")}
+                if all(posts[x["id"]]["status"] not in ("Scheduled", "Publishing") for x in (stale, unverified, via_metricool)):
+                    break
+                time.sleep(.5)
+            check(posts[stale["id"]]["status"] == "NeedsAttention" and "Nothing was sent" in posts[stale["id"]]["error"], "Overdue scheduled posts are not published late")
+            check(posts[unverified["id"]]["status"] == "NeedsAttention" and "not been verified" in posts[unverified["id"]]["error"], "Unverified account tokens are never used to publish")
+            sent = posts[via_metricool["id"]]
+            check(sent["status"] == "Published" and sent["remoteId"] == "metricool:99", "A due post for a mapped brand is handed to Metricool")
+            created = [r for r in FakeMetricool.requests if r["method"] == "POST" and r["path"].startswith("/v2/scheduler/posts")]
+            check(len(created) == 1 and created[0]["body"]["providers"] == [{"network": "linkedin"}] and created[0]["body"]["autoPublish"] is True, "Metricool receives the post's network")
+            check(created[0]["body"]["text"] == "Read https://example.com/demo?utm_source=linkedin&utm_medium=social&utm_campaign=via-metricool, then https://www.example.com/a?x=1&utm_source=linkedin&utm_medium=social&utm_campaign=via-metricool#top and https://other.org/x", "Links to the brand's site get UTM tags when sent; other links are untouched")
+            check(any(x["caption"] == tracked for x in persisted.call("/api/posts")), "The stored caption stays clean")
+            instagram = persisted.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Instagram via Metricool", platform="Instagram", caption="Caption"))
+            instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "review", "version": instagram["version"]})
+            instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "approve", "version": instagram["version"]})
+            persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "publish", "version": instagram["version"]}, expected=400)
+            check(True, "Posts for a network not connected in Metricool cannot be scheduled")
             persisted.call("/api/logout", "POST")
             persisted.call("/api/posts", expected=401)
             check(True, "Sign-out removes access")
@@ -154,7 +392,13 @@ def main():
             process.terminate()
             process.wait(timeout=10)
             log.close()
-    print(f"\n{checks} integration checks passed; no external publishing calls made.")
+            metricool.shutdown()
+            if SQLSERVER:
+                try:
+                    sql(tmp, f"ALTER DATABASE [{DATABASE}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{DATABASE}]", database="master")
+                except subprocess.CalledProcessError as e:
+                    print(f"WARNING: could not drop test database {DATABASE}: {e.stdout or e.stderr}", flush=True)
+    print(f"\n{checks} integration checks passed on {'SQL Server' if SQLSERVER else 'SQLite'}; no external publishing calls made (Metricool is simulated locally).")
 
 
 if __name__ == "__main__":

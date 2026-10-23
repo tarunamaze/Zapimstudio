@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations.Schema;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
 
@@ -8,7 +9,7 @@ public class Brand
     public int Id { get; set; }
     public string Name { get; set; } = "";
     public string Website { get; set; } = "";
-    public string Color { get; set; } = "#087f76";
+    public string Color { get; set; } = "#0038C9";
     public string Tone { get; set; } = "Clear, confident and helpful";
     public string Audience { get; set; } = "";
     public string Description { get; set; } = "";
@@ -49,6 +50,8 @@ public class Post
     public string ReviewNote { get; set; } = "";
     public string RemoteId { get; set; } = "";
     public string Error { get; set; } = "";
+    // The creative's type (image or PDF carousel), filled in for listings; not stored.
+    [NotMapped] public string AssetType { get; set; } = "";
 }
 public class SocialAccount
 {
@@ -89,6 +92,10 @@ public class MarketingDb(DbContextOptions<MarketingDb> options) : DbContext(opti
     public DbSet<AuditEntry> Audit => Set<AuditEntry>();
     protected override void OnModelCreating(ModelBuilder b)
     {
+        // Indexed strings need a bounded length on SQL Server (nvarchar(max) cannot be an index key).
+        b.Entity<TeamUser>().Property(x => x.Email).HasMaxLength(254);
+        b.Entity<Post>().Property(x => x.Status).HasMaxLength(32);
+        b.Entity<SocialAccount>().Property(x => x.Platform).HasMaxLength(32);
         b.Entity<TeamUser>().HasIndex(x => x.Email).IsUnique();
         b.Entity<Membership>().HasKey(x => new { x.UserId, x.BrandId });
         b.Entity<TeamUser>().HasMany(x => x.Memberships).WithOne().HasForeignKey(x => x.UserId);
