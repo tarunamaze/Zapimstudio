@@ -4,7 +4,7 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
 namespace Zapim.Marketing;
-public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db, MetricoolClient metricool)
+public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db, MetricoolClient metricool, LinkTracking links)
 {
     // Where a brand's post goes: its Metricool brand when Metricool is configured and mapped, otherwise its own platform account.
     public static async Task<SocialAccount?> Destination(MarketingDb db, MetricoolSettings metricool, int brandId, string platform, CancellationToken ct = default)
@@ -49,37 +49,43 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
         Rules.Require(a.VerifiedAt.HasValue, "The account token was replaced and has not been verified. Verify the account, then reschedule this post.");
         var image = post.AssetId.Length > 0 ? await db.Assets.FindAsync([post.AssetId], ct) : null;
         var mediaUrl = $"{config["PublicBaseUrl"]?.TrimEnd('/')}/media/{post.AssetId}";
+        var document = image?.ContentType == "application/pdf";
+        Rules.Require(!document || post.Platform == "LinkedIn", "PDF carousels can only be posted to LinkedIn.");
+        // UTM tags are added here, so the caption the team edits stays clean.
+        var caption = links.Apply(post.Caption, (await db.Brands.FindAsync([post.BrandId], ct))?.Website ?? "", post.Platform, post.Title);
         if (a.Platform == MetricoolClient.Platform)
         {
             Rules.Require(post.Platform != "Instagram" || image?.ContentType == "image/jpeg", "Instagram requires a JPEG image.");
-            return "metricool:" + await metricool.Schedule(post, a.ExternalId, image is null ? null : mediaUrl, ct);
+            return "metricool:" + await metricool.Schedule(post, caption, a.ExternalId, image is null ? null : mediaUrl, document, ct);
         }
         if (a.Platform == "LinkedIn")
         {
             string? imageUrn = null;
+            // Images and documents (PDF carousels) use the same upload flow on different LinkedIn resources.
+            var (resource, key) = document ? ("documents", "document") : ("images", "image");
             if (image is not null)
             {
-                var init = Request(HttpMethod.Post, "https://api.linkedin.com/rest/images?action=initializeUpload", a, true);
+                var init = Request(HttpMethod.Post, $"https://api.linkedin.com/rest/{resource}?action=initializeUpload", a, true);
                 init.Content = JsonContent.Create(new { initializeUploadRequest = new { owner = a.ExternalId } });
                 using var initialized = await Json(init, ct);
-                var value = initialized.RootElement.GetProperty("value"); imageUrn = value.GetProperty("image").GetString();
+                var value = initialized.RootElement.GetProperty("value"); imageUrn = value.GetProperty(key).GetString();
                 var uri = new Uri(value.GetProperty("uploadUrl").GetString()!);
                 Rules.Require(uri.Scheme == "https" && (uri.Host.EndsWith(".linkedin.com") || uri.Host.EndsWith(".licdn.com")), "Unexpected LinkedIn upload destination.");
                 using var upload = Request(HttpMethod.Put, uri.AbsoluteUri, a);
                 upload.Content = new ByteArrayContent(await File.ReadAllBytesAsync(storage.AssetPath(image.Id), ct));
                 upload.Content.Headers.ContentType = new MediaTypeHeaderValue(image.ContentType);
-                using var uploaded = await Client.SendAsync(upload, ct); Rules.Require(uploaded.IsSuccessStatusCode, "LinkedIn image upload failed.", 502);
+                using var uploaded = await Client.SendAsync(upload, ct); Rules.Require(uploaded.IsSuccessStatusCode, $"LinkedIn {key} upload failed.", 502);
                 var available = false;
                 for (var i = 0; i < 12; i++)
                 {
-                    using var status = await Json(Request(HttpMethod.Get, "https://api.linkedin.com/rest/images/" + Uri.EscapeDataString(imageUrn!), a, true), ct);
+                    using var status = await Json(Request(HttpMethod.Get, $"https://api.linkedin.com/rest/{resource}/" + Uri.EscapeDataString(imageUrn!), a, true), ct);
                     var state = status.RootElement.GetProperty("status").GetString();
                     if (state == "AVAILABLE") { available = true; break; }
-                    Rules.Require(state != "PROCESSING_FAILED", "LinkedIn could not process this image."); await Task.Delay(1500, ct);
+                    Rules.Require(state != "PROCESSING_FAILED", $"LinkedIn could not process this {key}."); await Task.Delay(1500, ct);
                 }
-                Rules.Require(available, "LinkedIn image processing timed out.");
+                Rules.Require(available, $"LinkedIn {key} processing timed out.");
             }
-            var body = new Dictionary<string, object> { ["author"] = a.ExternalId, ["commentary"] = post.Caption, ["visibility"] = "PUBLIC", ["distribution"] = new { feedDistribution = "MAIN_FEED", targetEntities = Array.Empty<string>(), thirdPartyDistributionChannels = Array.Empty<string>() }, ["lifecycleState"] = "PUBLISHED", ["isReshareDisabledByAuthor"] = false };
+            var body = new Dictionary<string, object> { ["author"] = a.ExternalId, ["commentary"] = caption, ["visibility"] = "PUBLIC", ["distribution"] = new { feedDistribution = "MAIN_FEED", targetEntities = Array.Empty<string>(), thirdPartyDistributionChannels = Array.Empty<string>() }, ["lifecycleState"] = "PUBLISHED", ["isReshareDisabledByAuthor"] = false };
             if (imageUrn is not null) body["content"] = new { media = new { id = imageUrn, title = post.Title } };
             using var request = Request(HttpMethod.Post, "https://api.linkedin.com/rest/posts", a, true); request.Content = JsonContent.Create(body);
             using var response = await Client.SendAsync(request, ct);
@@ -90,12 +96,12 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
         if (a.Platform == "Facebook")
         {
             var request = Request(HttpMethod.Post, $"{Graph}/{a.ExternalId}/{(image is null ? "feed" : "photos")}", a);
-            request.Content = new FormUrlEncodedContent(image is null ? new Dictionary<string, string> { ["message"] = post.Caption } : new Dictionary<string, string> { ["caption"] = post.Caption, ["url"] = mediaUrl, ["published"] = "true" });
+            request.Content = new FormUrlEncodedContent(image is null ? new Dictionary<string, string> { ["message"] = caption } : new Dictionary<string, string> { ["caption"] = caption, ["url"] = mediaUrl, ["published"] = "true" });
             using var result = await Json(request, ct); return result.RootElement.TryGetProperty("post_id", out var p) ? p.GetString()! : result.RootElement.GetProperty("id").GetString()!;
         }
         Rules.Require(image is not null && image.ContentType == "image/jpeg", "Instagram requires a JPEG image.");
         var containerRequest = Request(HttpMethod.Post, $"{Graph}/{a.ExternalId}/media", a);
-        containerRequest.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["image_url"] = mediaUrl, ["caption"] = post.Caption });
+        containerRequest.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["image_url"] = mediaUrl, ["caption"] = caption });
         using var container = await Json(containerRequest, ct); var containerId = container.RootElement.GetProperty("id").GetString();
         var ready = false;
         for (var i = 0; i < 20; i++)

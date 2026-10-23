@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations.Schema;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
 
@@ -49,6 +50,8 @@ public class Post
     public string ReviewNote { get; set; } = "";
     public string RemoteId { get; set; } = "";
     public string Error { get; set; } = "";
+    // The creative's type (image or PDF carousel), filled in for listings; not stored.
+    [NotMapped] public string AssetType { get; set; } = "";
 }
 public class SocialAccount
 {

@@ -55,6 +55,8 @@ builder.Services.AddScoped<Publisher>();
 builder.Services.AddScoped<MetricoolClient>();
 builder.Services.AddSingleton<MetricoolSettings>();
 builder.Services.AddSingleton<OpenAiSettings>();
+builder.Services.AddSingleton<LinkTracking>();
+PageFetcher.Register(builder.Services);
 builder.Services.AddHostedService<PublishingWorker>();
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
@@ -168,7 +170,11 @@ api.MapPut("/brands/{brandId:int}", async (int brandId, BrandInput input, HttpCo
 });
 api.MapGet("/posts", async (HttpContext ctx, MarketingDb db) =>
 {
-    var ids = Rules.Brands(ctx, db).Select(x => x.Id); return await db.Posts.Where(x => ids.Contains(x.BrandId)).OrderByDescending(x => x.UpdatedAt).ToListAsync();
+    var ids = Rules.Brands(ctx, db).Select(x => x.Id); var posts = await db.Posts.Where(x => ids.Contains(x.BrandId)).OrderByDescending(x => x.UpdatedAt).ToListAsync();
+    var assetIds = posts.Select(p => p.AssetId).Where(a => a != "").Distinct().ToList();
+    var types = await db.Assets.Where(a => assetIds.Contains(a.Id)).ToDictionaryAsync(a => a.Id, a => a.ContentType);
+    foreach (var p in posts) p.AssetType = types.GetValueOrDefault(p.AssetId, "");
+    return posts;
 });
 api.MapPost("/brands/{brandId:int}/posts", async (int brandId, PostInput input, HttpContext ctx, MarketingDb db) =>
 {
@@ -217,7 +223,7 @@ api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, 
 api.MapGet("/brands/{brandId:int}/accounts", async (int brandId, HttpContext ctx, MarketingDb db) => { await Rules.Brand(ctx, db, brandId); return await db.Accounts.Where(x => x.BrandId == brandId).ToListAsync(); });
 api.MapPost("/brands/{brandId:int}/accounts", async (int brandId, AccountInput input, HttpContext ctx, MarketingDb db, IDataProtectionProvider protection) =>
 {
-    Rules.Admin(ctx); await Rules.Brand(ctx, db, brandId); Rules.Platform(input.Platform);
+    Rules.Admin(ctx); await Rules.Brand(ctx, db, brandId); Rules.DirectPlatform(input.Platform);
     Rules.Require(input.Name.Length is > 0 and <= 100 && input.Token.Length is > 10 and < 8000 && input.ExpiresAt > DateTime.UtcNow, "Provide a label, valid token and future expiry.");
     Rules.Require(input.Platform == "LinkedIn" ? System.Text.RegularExpressions.Regex.IsMatch(input.ExternalId, "^urn:li:(organization|person):[A-Za-z0-9_-]+$") : System.Text.RegularExpressions.Regex.IsMatch(input.ExternalId, "^[0-9]+$"), "Use a LinkedIn author URN or numeric Meta account ID.");
     var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == input.Platform) ?? new SocialAccount { BrandId = brandId, Platform = input.Platform };
@@ -240,6 +246,9 @@ object OpenAiStatus(OpenAiSettings s) => new
     configured = s.Configured, source = s.Source, updatedAt = s.UpdatedAt, textModel = s.Current?.TextModel ?? s.DefaultTextModel, imageModel = s.Current?.ImageModel ?? s.DefaultImageModel,
     defaultTextModel = s.DefaultTextModel, defaultImageModel = s.DefaultImageModel
 };
+object LinkStatus(LinkTracking s) => new { enabled = s.Enabled, medium = s.Medium, updatedAt = s.UpdatedAt };
+api.MapGet("/settings/links", (HttpContext ctx, LinkTracking settings) => { Rules.Admin(ctx); return LinkStatus(settings); });
+api.MapPut("/settings/links", (LinkTrackingInput input, HttpContext ctx, LinkTracking settings) => { Rules.Admin(ctx); settings.Save(input.Enabled, input.Medium); return LinkStatus(settings); });
 api.MapGet("/settings/openai", (HttpContext ctx, OpenAiSettings settings) => { Rules.Admin(ctx); return OpenAiStatus(settings); });
 api.MapPut("/settings/openai", async (OpenAiSettingsInput input, HttpContext ctx, OpenAiSettings settings) =>
 {
@@ -284,7 +293,7 @@ api.MapDelete("/accounts/{id:int}", async (int id, HttpContext ctx, MarketingDb 
 api.MapPost("/brands/{brandId:int}/assets", async (int brandId, HttpContext ctx, MarketingDb db, Storage files) =>
 {
     await Rules.Brand(ctx, db, brandId); var form = await ctx.Request.ReadFormAsync(); var file = form.Files.FirstOrDefault();
-    Rules.Require(file is not null && file.Length is > 0 and <= 5_000_000, "Upload a JPEG or PNG under 5 MB.");
+    Rules.Require(file is not null && file.Length is > 0 and <= 10_000_000, "Upload a JPEG or PNG under 5 MB, or a PDF carousel under 10 MB.");
     using var ms = new MemoryStream(); await file!.CopyToAsync(ms);
     return await files.Save(db, brandId, ms.ToArray(), Path.GetFileName(file.FileName));
 });
@@ -305,6 +314,18 @@ api.MapPost("/brands/{brandId:int}/generate", async (int brandId, GenerateInput 
 api.MapPost("/brands/{brandId:int}/plan", async (int brandId, PlanInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
 {
     var brand = await Rules.Brand(ctx, db, brandId); return await service.Plan(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/repurpose", async (int brandId, RepurposeInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Repurpose(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/carousel", async (int brandId, CarouselInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Carousel(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/article", async (int brandId, ArticleInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Article(brand, input);
 }).RequireRateLimiting("ai");
 api.MapPost("/brands/{brandId:int}/generate-image", async (int brandId, GenerateInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
 {
@@ -340,6 +361,10 @@ public record LoginInput(string Email, string Password);
 public record BrandInput(string Name, string Website, string Color, string Tone, string Audience, string Description, string LogoAssetId = "");
 // SuggestedAt is the AI's (or the author's) proposed publish time for a draft; scheduling still needs approval.
 public record PostInput(string Title, string Platform, string Caption, string AssetId = "", int Version = 0, DateTime? SuggestedAt = null);
+public record RepurposeInput(string StartDate, string[] Platforms, int Posts, string Url = "", string Text = "", string Title = "", string TimeZone = "");
+public record CarouselInput(string Brief = "", int Slides = 6);
+public record ArticleInput(string Topic = "", string Keyword = "", int Words = 1200);
+public record LinkTrackingInput(bool Enabled, string Medium = "");
 public record PlanInput(string StartDate, int Weeks, int PostsPerWeek, string[] Platforms, string Goal = "", string TimeZone = "");
 public record TransitionInput(string Action, int Version, DateTime? ScheduledAt = null, string Note = "");
 public record MetricoolInput(string BlogId);

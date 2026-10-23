@@ -59,6 +59,18 @@ class Client:
         assert response.code == expected, f"{method} {path}: expected {expected}, got {response.code}: {raw[:500]}"
         return json.loads(raw) if raw else {}
 
+    def upload(self, path, filename, data, content_type, expected=200):
+        boundary = "zapim-test-boundary"
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(BASE + path, body, {"Content-Type": f"multipart/form-data; boundary={boundary}", "X-CSRF-TOKEN": self.token}, method="POST")
+        try:
+            response = self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as e:
+            response = e
+        raw = response.read()
+        assert response.code == expected, f"upload {path}: expected {expected}, got {response.code}: {raw[:300]}"
+        return json.loads(raw) if raw else {}
+
     def session(self):
         s = self.call("/api/session")
         self.token = s["csrfToken"]
@@ -113,12 +125,18 @@ class FakeMetricool(http.server.BaseHTTPRequestHandler):
             data = json.loads(request["input"])
             if request["text"]["format"]["name"] == "content_plan":
                 start = datetime.date.fromisoformat(data["startDate"])
-                post = {"time": "09:30", "pillar": "Channel explainers", "title": "What is RCS?", "caption": "RCS explained.", "creativeHeadline": "Texts that act like apps", "kicker": "rcs explained", "layout": "editorial", "imagePrompt": "", "rationale": "Mid-week reach."}
+                post = {"time": "09:30", "pillar": "Channel explainers", "title": "What is RCS?", "caption": "RCS explained.", "creativeHeadline": "Texts that act like apps", "kicker": "rcs explained", "layout": "editorial", "slides": [], "imagePrompt": "", "rationale": "Mid-week reach."}
+                slides = [{"headline": f"Slide {n}", "body": "Body"} for n in range(1, 4)]
                 result = {"summary": "Two explainers.", "posts": [
-                    dict(post, date=str(start), platform="LinkedIn"),
+                    dict(post, date=str(start), platform="LinkedIn", layout="carousel", slides=slides),
                     dict(post, date=str(start + datetime.timedelta(days=2)), platform="LinkedIn", layout="sculpture", time="7pm"),
                     dict(post, date=str(start + datetime.timedelta(days=1)), platform="Instagram"),
                     dict(post, date=str(start + datetime.timedelta(days=30)), platform="LinkedIn")]}
+            elif request["text"]["format"]["name"] == "carousel":
+                result = {"title": "Five steps", "caption": "Swipe through.", "slides": [{"headline": f"Step {n}", "body": "Do this."} for n in range(1, 6)]}
+            elif request["text"]["format"]["name"] == "seo_article":
+                result = {"title": "AI voice agents for collections", "metaDescription": "How AI voice agents help lenders collect on time.", "slug": "AI Voice Agents: Collections!", "primaryKeyword": "ai voice agent",
+                          "secondaryKeywords": ["collections", "nbfc"], "body": "## Why it matters\n\n" + "Lenders call borrowers every day. " * 40, "faq": [{"question": "Is it multilingual?", "answer": "Yes."}]}
             else:
                 result = {"title": "Picked by AI", "caption": "A caption.", "creativeHeadline": "One platform", "kicker": "every channel", "layout": "none", "imagePrompt": "An office.", "time": "18:00", "rationale": "Evening reach."}
             return self.reply(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(result)}]}]})
@@ -257,6 +275,20 @@ def main():
             check("CPaaS" in sent["input"] or "Brand A" in sent["input"], "The plan request carries the brand context")
             picked = editor.call(f'/api/brands/{a["id"]}/generate', "POST", {"brief": "", "platform": "Instagram"})
             check(picked["title"] == "Picked by AI" and picked["layout"] == "editorial" and picked["time"] == "18:00", "AI can pick the topic, and never chooses text-only for Instagram")
+            check(plan["posts"][0]["layout"] == "carousel" and len(plan["posts"][0]["slides"]) == 3, "Plans can propose LinkedIn carousels with their slides")
+            reviewer.session()
+            repurpose = {"startDate": plan_start, "platforms": ["LinkedIn"], "posts": 2}
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="http://example.com/blog"), expected=400)
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="https://other.org/blog"), expected=400)
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="https://example.com:8443/blog"), expected=400)
+            reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, text="Too short."), expected=400)
+            check(True, "Repurposing only reads https pages on the brand's own site, and needs real source text")
+            series = reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, text="Lenders call borrowers every day. " * 20, title="Collections"))
+            check(len(series["posts"]) == 2 and all(x["platform"] == "LinkedIn" for x in series["posts"]), "An article becomes dated posts on the chosen channels")
+            carousel = reviewer.call(f'/api/brands/{a["id"]}/carousel', "POST", {"brief": "Collections", "slides": 5})
+            check(len(carousel["slides"]) == 5 and carousel["title"] == "Five steps", "AI writes carousel slides")
+            article = reviewer.call(f'/api/brands/{a["id"]}/article', "POST", {"topic": "Collections", "keyword": "", "words": 1200})
+            check(article["slug"] == "ai-voice-agents-collections" and article["words"] > 100 and article["faq"][0]["question"], "AI writes SEO articles with a clean slug and FAQ")
             check(not admin.call("/api/settings/openai", "DELETE")["configured"] and not admin.session()["aiEnabled"], "Removing the OpenAI key disables AI")
             admin.call(f'/api/brands/{a["id"]}/plan', "POST", plan_input, expected=400)
             check(True, "Planning without an OpenAI key is refused clearly")
@@ -284,7 +316,22 @@ def main():
             check(mapped["account"]["name"] == "Zapim in Metricool" and mapped["networks"] == ["LinkedIn", "Facebook"], "Mapping reads the Metricool brand and its connected networks")
             check(admin.call(f'/api/brands/{a["id"]}/metricool')["account"] is None, "Metricool mapping is per brand")
             check(all(r["auth"] == "test-metricool-token" and "blogId=4242" in r["path"] and "userId=777" in r["path"] for r in FakeMetricool.requests if "4242" in r["path"]), "Metricool calls carry the token header, userId and blogId")
-            via_metricool = admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Via Metricool"))
+            links = admin.call("/api/settings/links")
+            check(links["enabled"] and links["medium"] == "social", "Link tracking is on by default")
+            editor.call("/api/settings/links", "PUT", {"enabled": False, "medium": ""}, expected=403)
+            admin.call("/api/settings/links", "PUT", {"enabled": True, "medium": "bad medium!"}, expected=400)
+            check(True, "Only admins change link tracking, and the medium is validated")
+            tracked = "Read https://example.com/demo, then https://www.example.com/a?x=1#top and https://other.org/x"
+            via_metricool = admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Via Metricool", caption=tracked))
+            admin.call(f'/api/brands/{b["id"]}/accounts', "POST", {"platform": "Google", "name": "x", "externalId": "1", "token": "never-used-token", "expiresAt": "2035-01-01T00:00:00Z"}, expected=400)
+            admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, platform="Google", caption="x" * 1501), expected=400)
+            check(admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Local post", platform="Google"))["platform"] == "Google", "Google Business posts are drafted, through Metricool only, within 1,500 characters")
+            pdf = admin.upload(f'/api/brands/{b["id"]}/assets', "carousel.pdf", b"%PDF-1.4\n1 0 obj\n<< >>\nendobj\n%%EOF\n", "application/pdf")
+            check(pdf["contentType"] == "application/pdf", "PDF carousels can be uploaded")
+            admin.upload(f'/api/brands/{b["id"]}/assets', "fake.pdf", b"not a pdf at all", "application/pdf", expected=400)
+            admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, platform="Facebook", assetId=pdf["id"]), expected=400)
+            deck = admin.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Deck", assetId=pdf["id"]))
+            check(next(x for x in admin.call("/api/posts") if x["id"] == deck["id"])["assetType"] == "application/pdf", "PDF carousels post to LinkedIn only and are labelled in listings")
             anon = Client()
             anon.session()
             anon.call("/api/login", "POST", {}, expected=400)
@@ -320,7 +367,9 @@ def main():
             sent = posts[via_metricool["id"]]
             check(sent["status"] == "Published" and sent["remoteId"] == "metricool:99", "A due post for a mapped brand is handed to Metricool")
             created = [r for r in FakeMetricool.requests if r["method"] == "POST" and r["path"].startswith("/v2/scheduler/posts")]
-            check(len(created) == 1 and created[0]["body"]["providers"] == [{"network": "linkedin"}] and created[0]["body"]["text"] == "A caption to review" and created[0]["body"]["autoPublish"] is True, "Metricool receives the caption and the post's network")
+            check(len(created) == 1 and created[0]["body"]["providers"] == [{"network": "linkedin"}] and created[0]["body"]["autoPublish"] is True, "Metricool receives the post's network")
+            check(created[0]["body"]["text"] == "Read https://example.com/demo?utm_source=linkedin&utm_medium=social&utm_campaign=via-metricool, then https://www.example.com/a?x=1&utm_source=linkedin&utm_medium=social&utm_campaign=via-metricool#top and https://other.org/x", "Links to the brand's site get UTM tags when sent; other links are untouched")
+            check(any(x["caption"] == tracked for x in persisted.call("/api/posts")), "The stored caption stays clean")
             instagram = persisted.call(f'/api/brands/{b["id"]}/posts', "POST", dict(payload, title="Instagram via Metricool", platform="Instagram", caption="Caption"))
             instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "review", "version": instagram["version"]})
             instagram = persisted.call(f'/api/posts/{instagram["id"]}/transition', "POST", {"action": "approve", "version": instagram["version"]})

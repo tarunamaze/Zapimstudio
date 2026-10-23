@@ -36,7 +36,7 @@ public class MetricoolClient(IHttpClientFactory factory, IConfiguration config, 
 {
     public const string Platform = "Metricool";
     private string Api => (config["Metricool:BaseUrl"] is { Length: > 0 } url ? url : "https://app.metricool.com/api").TrimEnd('/');
-    private static readonly Dictionary<string, string> Networks = new() { ["LinkedIn"] = "linkedin", ["Facebook"] = "facebook", ["Instagram"] = "instagram" };
+    private static readonly Dictionary<string, string> Networks = new() { ["LinkedIn"] = "linkedin", ["Facebook"] = "facebook", ["Instagram"] = "instagram", ["Google"] = "gmb" };
 
     private HttpRequestMessage Request(HttpMethod method, string path, string blogId)
     {
@@ -69,6 +69,7 @@ public class MetricoolClient(IHttpClientFactory factory, IConfiguration config, 
             if (Text("linkedinCompany") != "") networks.Add("LinkedIn");
             if (Text("facebookPageId") != "" || Text("facebook") != "") networks.Add("Facebook");
             if (Text("instagram") != "") networks.Add("Instagram");
+            if (Text("gmb") != "") networks.Add("Google");
             var label = new[] { Text("label"), Text("title"), "Metricool brand " + blogId }.First(x => x != "");
             return new MetricoolBrand(blogId, label[..Math.Min(label.Length, 100)], [.. networks]);
         }
@@ -76,7 +77,7 @@ public class MetricoolClient(IHttpClientFactory factory, IConfiguration config, 
     }
 
     // Hands the post to Metricool's scheduler for immediate publication and returns Metricool's post ID.
-    public async Task<string> Schedule(Post post, string blogId, string? mediaUrl, CancellationToken ct)
+    public async Task<string> Schedule(Post post, string caption, string blogId, string? mediaUrl, bool document, CancellationToken ct)
     {
         var network = Networks[post.Platform];
         // Metricool only accepts future publication times.
@@ -84,7 +85,7 @@ public class MetricoolClient(IHttpClientFactory factory, IConfiguration config, 
         var body = new Dictionary<string, object>
         {
             ["publicationDate"] = new { dateTime = at, timezone = "UTC" },
-            ["text"] = post.Caption,
+            ["text"] = caption,
             ["providers"] = new[] { new { network } },
             ["media"] = mediaUrl is null ? Array.Empty<string>() : [mediaUrl],
             ["saveExternalMediaFiles"] = mediaUrl is not null,
@@ -93,6 +94,7 @@ public class MetricoolClient(IHttpClientFactory factory, IConfiguration config, 
             ["shortener"] = false,
         };
         if (post.Platform == "Facebook") body["facebookData"] = new { type = "POST" };
+        if (document) body["linkedinData"] = new { documentTitle = post.Title };
         if (post.Platform == "Instagram") body["instagramData"] = new { type = "POST", autoPublish = true };
         var request = Request(HttpMethod.Post, "/v2/scheduler/posts", blogId);
         request.Content = JsonContent.Create(body);
