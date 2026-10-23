@@ -134,6 +134,7 @@ public class ContentService(IHttpClientFactory factory, OpenAiSettings ai, Marke
     public async Task<object> Plan(Brand brand, PlanInput input)
     {
         var openAi = Key("plan content with AI");
+        if (input.Dates is { Length: > 0 }) return await PlanDates(brand, input, openAi);
         Rules.Require(DateOnly.TryParseExact(input.StartDate, "yyyy-MM-dd", out var start), "Choose a start date.");
         Rules.Require(input.Weeks is >= 1 and <= 4 && input.PostsPerWeek is >= 1 and <= 7, "Plan 1 to 4 weeks with 1 to 7 posts a week.");
         var channels = Channels(input.Platforms);
@@ -146,6 +147,36 @@ public class ContentService(IHttpClientFactory factory, OpenAiSettings ai, Marke
             new { brand.Name, brand.Description, brand.Tone, brand.Audience, brand.Website, channels, goal = input.Goal, startDate = start.ToString("yyyy-MM-dd"), endDate = end.ToString("yyyy-MM-dd"), timeZone = input.TimeZone, recentPostTitles = await RecentTitles(brand.Id) },
             "content_plan", PlanSchema);
         return new { summary = Text(r, "summary", 1000), posts = Dated(r, channels, start, end, count), source = "AI plan", notice = "Every post becomes a draft that still needs review and approval before it is scheduled." };
+    }
+
+    // One post for each date the team chose, on that date's channel and about its occasion (or a topic the AI picks).
+    // The dates and channels are the team's: whatever the AI returns, each post keeps its own row's date and channel.
+    private async Task<object> PlanDates(Brand brand, PlanInput input, OpenAiCredentials openAi)
+    {
+        Rules.Require(input.Dates!.Length <= 20, "Plan up to 20 dates at a time.");
+        Rules.Require(input.Goal.Length <= 1000, "Keep the goal under 1,000 characters.");
+        var today = DateOnly.FromDateTime(DateTime.UtcNow).AddDays(-1);
+        var rows = input.Dates.Select(d =>
+        {
+            Rules.Require(DateOnly.TryParseExact(d.Date, "yyyy-MM-dd", out var day) && day >= today && day <= today.AddYears(2), "Choose dates from today up to two years ahead.");
+            Rules.Platform(d.Platform);
+            Rules.Require(d.Note.Length <= 500, "Keep each date's note under 500 characters.");
+            return new { date = day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), platform = d.Platform, note = d.Note.Trim() };
+        }).ToArray();
+        var r = await Ask(openAi, Direction + $" Create exactly {rows.Length} posts, one for each entry in dates and in the same order, each for that entry's date and platform. " +
+            "Write each post about the entry's note when one is given. When the note is empty, choose a topic that suits the brand on that date; mention a festival, observance or event only when it is well known and genuinely falls on that date, never invent one. " +
+            "Recommend the best local time on that date for the channel's audience, vary the angles and layouts, and avoid repeating recent post titles. summary explains the set in 1-2 sentences.",
+            new { brand.Name, brand.Description, brand.Tone, brand.Audience, brand.Website, dates = rows, goal = input.Goal, timeZone = input.TimeZone, recentPostTitles = await RecentTitles(brand.Id) },
+            "content_plan", PlanSchema);
+        var returned = r.GetProperty("posts").EnumerateArray().ToArray();
+        Rules.Require(returned.Length > 0, "The AI did not return usable posts. Try again.", 502);
+        var posts = rows.Select((row, i) =>
+        {
+            var post = Post(returned[Math.Min(i, returned.Length - 1)], row.platform);
+            post["date"] = row.date; post["pillar"] = row.note.Length > 0 ? (row.note.Length > 60 ? row.note[..60] : row.note) : Text(returned[Math.Min(i, returned.Length - 1)], "pillar", 60);
+            return (object)post;
+        }).Take(returned.Length).ToList();
+        return new { summary = Text(r, "summary", 1000), posts, source = "AI plan", notice = "Every post becomes a draft that still needs review and approval before it is scheduled." };
     }
 
     // Turns a page on the brand's website, or an article's text, into dated social posts that link back to it.

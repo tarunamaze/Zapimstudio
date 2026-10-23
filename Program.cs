@@ -365,7 +365,9 @@ public record RepurposeInput(string StartDate, string[] Platforms, int Posts, st
 public record CarouselInput(string Brief = "", int Slides = 6);
 public record ArticleInput(string Topic = "", string Keyword = "", int Words = 1200);
 public record LinkTrackingInput(bool Enabled, string Medium = "");
-public record PlanInput(string StartDate, int Weeks, int PostsPerWeek, string[] Platforms, string Goal = "", string TimeZone = "");
+// With Dates, the plan has exactly one post per chosen date and channel; otherwise it spreads posts over the weeks.
+public record PlanInput(string StartDate, int Weeks, int PostsPerWeek, string[] Platforms, string Goal = "", string TimeZone = "", PlanDate[]? Dates = null);
+public record PlanDate(string Date, string Platform, string Note = "");
 public record TransitionInput(string Action, int Version, DateTime? ScheduledAt = null, string Note = "");
 public record MetricoolInput(string BlogId);
 public record MetricoolSettingsInput(string UserId, string Token = "");

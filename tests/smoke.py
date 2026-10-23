@@ -123,7 +123,10 @@ class FakeMetricool(http.server.BaseHTTPRequestHandler):
                 return self.reply(401, {})
             request = FakeMetricool.requests[-1]["body"]
             data = json.loads(request["input"])
-            if request["text"]["format"]["name"] == "content_plan":
+            if request["text"]["format"]["name"] == "content_plan" and "dates" in data:
+                wrong = {"date": "2000-01-01", "platform": "Instagram", "time": "11:15", "pillar": "Picked", "title": "Dated post", "caption": "On the day.", "creativeHeadline": "Today", "kicker": "today", "layout": "editorial", "slides": [], "imagePrompt": "", "rationale": "Because."}
+                result = {"summary": "One per date.", "posts": [wrong for _ in data["dates"]]}
+            elif request["text"]["format"]["name"] == "content_plan":
                 start = datetime.date.fromisoformat(data["startDate"])
                 post = {"time": "09:30", "pillar": "Channel explainers", "title": "What is RCS?", "caption": "RCS explained.", "creativeHeadline": "Texts that act like apps", "kicker": "rcs explained", "layout": "editorial", "slides": [], "imagePrompt": "", "rationale": "Mid-week reach."}
                 slides = [{"headline": f"Slide {n}", "body": "Body"} for n in range(1, 4)]
@@ -276,6 +279,13 @@ def main():
             picked = editor.call(f'/api/brands/{a["id"]}/generate', "POST", {"brief": "", "platform": "Instagram"})
             check(picked["title"] == "Picked by AI" and picked["layout"] == "editorial" and picked["time"] == "18:00", "AI can pick the topic, and never chooses text-only for Instagram")
             check(plan["posts"][0]["layout"] == "carousel" and len(plan["posts"][0]["slides"]) == 3, "Plans can propose LinkedIn carousels with their slides")
+            day1 = str(datetime.date.today() + datetime.timedelta(days=5)); day2 = str(datetime.date.today() + datetime.timedelta(days=9))
+            dated_input = dict(plan_input, dates=[{"date": day1, "platform": "LinkedIn", "note": "Webinar launch"}, {"date": day2, "platform": "Google", "note": ""}])
+            admin.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, dates=[{"date": "2020-01-01", "platform": "LinkedIn", "note": ""}]), expected=400)
+            editor.call(f'/api/brands/{a["id"]}/plan', "POST", dict(plan_input, dates=[{"date": day1, "platform": "Myspace", "note": ""}]), expected=400)
+            check(True, "Specific dates must be current and on a known channel")
+            dated = editor.call(f'/api/brands/{a["id"]}/plan', "POST", dated_input)
+            check([(x["date"], x["platform"], x["pillar"]) for x in dated["posts"]] == [(day1, "LinkedIn", "Webinar launch"), (day2, "Google", "Picked")] and dated["posts"][0]["time"] == "11:15", "A plan on specific dates keeps each chosen date and channel, with the AI's time")
             reviewer.session()
             repurpose = {"startDate": plan_start, "platforms": ["LinkedIn"], "posts": 2}
             reviewer.call(f'/api/brands/{a["id"]}/repurpose', "POST", dict(repurpose, url="http://example.com/blog"), expected=400)

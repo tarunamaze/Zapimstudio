@@ -69,3 +69,9 @@ h1{font-weight:750;letter-spacing:-1.2px}
 .article-body{font-size:14px;line-height:1.75;border-top:1px solid var(--line);padding-top:8px}
 .article-body h2,.article-body h3,.article-body h4{font-family:var(--heading);margin:22px 0 8px}
 .article-body ul,.article-body ol{padding-left:22px}
+
+.tabs.small{margin:0 0 16px}
+.tabs.small button{padding:7px 14px;font-size:12px}
+.date-rows{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
+.date-row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;padding:12px;background:#F2F5FA;border-radius:12px}
+.date-row .date-note{grid-column:1/-1}
