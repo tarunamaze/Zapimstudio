@@ -13,7 +13,13 @@ var storage = Path.GetFullPath(builder.Configuration["StoragePath"] ?? "App_Data
 Directory.CreateDirectory(storage);
 Directory.CreateDirectory(Path.Combine(storage, "assets"));
 builder.Services.AddSingleton(new Storage(storage));
-builder.Services.AddDbContext<MarketingDb>(o => o.UseSqlite($"Data Source={Path.Combine(storage, "marketing.db")}"));
+// SQL Server when a connection string is configured; otherwise a SQLite file in the storage directory.
+var sqlServer = builder.Configuration.GetConnectionString("SqlServer");
+builder.Services.AddDbContext<MarketingDb>(o =>
+{
+    if (string.IsNullOrWhiteSpace(sqlServer)) o.UseSqlite($"Data Source={Path.Combine(storage, "marketing.db")}");
+    else o.UseSqlServer(sqlServer);
+});
 builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(storage, "keys"))).SetApplicationName("ZapimMarketing");
 builder.Services.AddAntiforgery(o => o.HeaderName = "X-CSRF-TOKEN");
 builder.Services.AddSingleton<IPasswordHasher<TeamUser>, PasswordHasher<TeamUser>>();
@@ -34,6 +40,9 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     };
 });
 builder.Services.AddAuthorization();
+// Reject missing or null JSON fields as 400s instead of failing later with a NullReferenceException.
+builder.Services.ConfigureHttpJsonOptions(o => { o.SerializerOptions.RespectNullableAnnotations = true; o.SerializerOptions.RespectRequiredConstructorParameters = true; });
+builder.Services.Configure<RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
 builder.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = 429;
@@ -43,6 +52,11 @@ builder.Services.AddRateLimiter(o =>
 builder.Services.AddHttpClient("external", c => c.Timeout = TimeSpan.FromMinutes(3));
 builder.Services.AddScoped<ContentService>();
 builder.Services.AddScoped<Publisher>();
+builder.Services.AddScoped<MetricoolClient>();
+builder.Services.AddSingleton<MetricoolSettings>();
+builder.Services.AddSingleton<OpenAiSettings>();
+builder.Services.AddSingleton<LinkTracking>();
+PageFetcher.Register(builder.Services);
 builder.Services.AddHostedService<PublishingWorker>();
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
@@ -59,7 +73,7 @@ using (var scope = app.Services.CreateScope())
     }
     if (!await db.Brands.AnyAsync())
     {
-        var brand = new Brand { Name = "Zapim", Website = "https://zapim.com", Color = "#087f76", Audience = "Marketing, customer experience and product leaders at Indian businesses", Description = "Business communication through WhatsApp, SMS, RCS, voice and email. Campaigns, support and transactional messaging in one platform.", Tone = "Confident, helpful, practical. Explain business outcomes clearly; avoid unsupported statistics." };
+        var brand = new Brand { Name = "Zapim", Website = ZapimContext.Website, Color = ZapimContext.Color, Audience = ZapimContext.Audience, Description = ZapimContext.Description, Tone = ZapimContext.Tone };
         db.Brands.Add(brand); await db.SaveChangesAsync();
         db.Posts.AddRange(
             new Post { BrandId = brand.Id, Title = "One conversation. Every channel.", Platform = "LinkedIn", Caption = "Your customers move between channels. Your team should be able to follow the conversation.\n\nExplore WhatsApp, SMS, RCS, voice and email with Zapim.\n\nSee how it works: https://zapim.com/request-demo\n\n#CustomerExperience #BusinessMessaging #Zapim", ReviewNote = "Starter draft — review product claims before publishing." },
@@ -67,6 +81,16 @@ using (var scope = app.Services.CreateScope())
             new Post { BrandId = brand.Id, Title = "A better way to follow up", Platform = "Facebook", Caption = "Keep customers informed with timely order updates and helpful follow-ups. Discover business messaging with Zapim.\n\nhttps://zapim.com/request-demo", ReviewNote = "Starter draft — review before publishing." });
         await db.SaveChangesAsync();
     }
+    // Give the starter Zapim brand its full context, unless someone has already edited it.
+    foreach (var starter in await db.Brands.Where(b => b.Name == "Zapim" && b.Description == ZapimContext.StarterDescription).ToListAsync())
+    {
+        starter.Description = ZapimContext.Description;
+        if (starter.Audience == ZapimContext.StarterAudience) starter.Audience = ZapimContext.Audience;
+        if (starter.Tone == ZapimContext.StarterTone) starter.Tone = ZapimContext.Tone;
+        if (starter.Color == ZapimContext.StarterColor) starter.Color = ZapimContext.Color;
+        await db.SaveChangesAsync();
+    }
+    await BrandPresets.Ensure(db);
     // Never silently retry an interrupted publish: the remote service may have accepted it.
     await db.Posts.Where(x => x.Status == "Publishing").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "NeedsAttention").SetProperty(x => x.Error, "Publishing was interrupted. Check the social profile for duplicates before creating a replacement draft."));
 }
@@ -80,6 +104,7 @@ app.Use(async (ctx, next) =>
     catch (RuleException e) { ctx.Response.StatusCode = e.Status; await ctx.Response.WriteAsJsonAsync(new { error = e.Message }); }
     catch (DbUpdateConcurrencyException) { ctx.Response.StatusCode = 409; await ctx.Response.WriteAsJsonAsync(new { error = "This post changed. Refresh and try again." }); }
     catch (AntiforgeryValidationException) { ctx.Response.StatusCode = 400; await ctx.Response.WriteAsJsonAsync(new { error = "Your session token expired. Refresh this page." }); }
+    catch (BadHttpRequestException e) when (!ctx.Response.HasStarted) { ctx.Response.StatusCode = e.StatusCode; await ctx.Response.WriteAsJsonAsync(new { error = "The request was incomplete or invalid. Refresh and try again." }); }
     catch (Exception e) when (!ctx.Response.HasStarted)
     {
         app.Logger.LogError("Request failed: {Type}", e.GetType().Name);
@@ -87,7 +112,10 @@ app.Use(async (ctx, next) =>
     }
 });
 if (!app.Environment.IsDevelopment()) app.UseHsts();
-app.UseDefaultFiles(); app.UseStaticFiles();
+app.UseDefaultFiles();
+// Revalidate on every load (a cheap 304 when unchanged) so browsers pick up a new deployment without a forced refresh.
+var revalidate = new StaticFileOptions { OnPrepareResponse = f => f.Context.Response.Headers.CacheControl = "no-cache" };
+app.UseStaticFiles(revalidate);
 app.UseAuthentication(); app.UseAuthorization(); app.UseRateLimiter();
 app.Use(async (ctx, next) =>
 {
@@ -96,21 +124,22 @@ app.Use(async (ctx, next) =>
     await next();
 });
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery csrf) => new
+app.MapGet("/api/session", async (HttpContext ctx, MarketingDb db, IAntiforgery csrf, MetricoolSettings metricoolSettings, OpenAiSettings openAiSettings) => new
 {
     csrfToken = csrf.GetAndStoreTokens(ctx).RequestToken,
     setupRequired = !await db.Users.AnyAsync(),
     setupAllowed = app.Environment.IsDevelopment(),
     user = ctx.User.Identity?.IsAuthenticated == true ? await db.Users.FindAsync(Rules.UserId(ctx)) : null,
-    aiEnabled = !string.IsNullOrWhiteSpace(builder.Configuration["AI:ApiKey"]),
+    aiEnabled = openAiSettings.Configured,
     publishingEnabled = builder.Configuration.GetValue<bool>("Publishing:Enabled"),
-    publicMediaConfigured = !string.IsNullOrWhiteSpace(builder.Configuration["PublicBaseUrl"])
+    publicMediaConfigured = !string.IsNullOrWhiteSpace(builder.Configuration["PublicBaseUrl"]),
+    metricoolConfigured = metricoolSettings.Configured
 });
 app.MapPost("/api/setup", async (LoginInput input, MarketingDb db, IPasswordHasher<TeamUser> hasher) =>
 {
     Rules.Require(app.Environment.IsDevelopment(), "Set Bootstrap__Email and Bootstrap__Password on the server to create the first administrator.", 403);
     // Transaction serializes first-admin creation across concurrent requests.
-    await using var tx = await db.Database.BeginTransactionAsync();
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
     Rules.Require(!await db.Users.AnyAsync(), "Setup is already complete.", 409);
     Rules.ValidateLogin(input);
     var user = new TeamUser { Name = "Administrator", Email = input.Email.Trim().ToLowerInvariant(), Role = "Admin" };
@@ -141,7 +170,11 @@ api.MapPut("/brands/{brandId:int}", async (int brandId, BrandInput input, HttpCo
 });
 api.MapGet("/posts", async (HttpContext ctx, MarketingDb db) =>
 {
-    var ids = Rules.Brands(ctx, db).Select(x => x.Id); return await db.Posts.Where(x => ids.Contains(x.BrandId)).OrderByDescending(x => x.UpdatedAt).ToListAsync();
+    var ids = Rules.Brands(ctx, db).Select(x => x.Id); var posts = await db.Posts.Where(x => ids.Contains(x.BrandId)).OrderByDescending(x => x.UpdatedAt).ToListAsync();
+    var assetIds = posts.Select(p => p.AssetId).Where(a => a != "").Distinct().ToList();
+    var types = await db.Assets.Where(a => assetIds.Contains(a.Id)).ToDictionaryAsync(a => a.Id, a => a.ContentType);
+    foreach (var p in posts) p.AssetType = types.GetValueOrDefault(p.AssetId, "");
+    return posts;
 });
 api.MapPost("/brands/{brandId:int}/posts", async (int brandId, PostInput input, HttpContext ctx, MarketingDb db) =>
 {
@@ -156,7 +189,7 @@ api.MapPut("/posts/{id:int}", async (int id, PostInput input, HttpContext ctx, M
     await Rules.ValidatePost(input, post.BrandId, db); Rules.ApplyPost(post, input); post.Status = "Draft"; post.ApprovedBy = null; post.Version++; post.UpdatedAt = DateTime.UtcNow;
     db.Audit.Add(new AuditEntry { BrandId = post.BrandId, PostId = id, UserId = Rules.UserId(ctx), Action = "Edited; approval reset" }); await db.SaveChangesAsync(); return post;
 });
-api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, HttpContext ctx, MarketingDb db) =>
+api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings metricoolSettings) =>
 {
     var post = await Rules.Post(ctx, db, id); Rules.Require(input.Version == post.Version, "This post changed. Refresh and try again.", 409);
     var old = post.Status;
@@ -170,12 +203,14 @@ api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, 
         case "publish":
             Rules.Approver(ctx); Rules.Require(old == "Approved", "Only approved posts can be published.");
             Rules.Require(builder.Configuration.GetValue<bool>("Publishing:Enabled"), "Live publishing is disabled. Enable Publishing__Enabled on the server after configuring accounts.");
-            var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == post.BrandId && x.Platform == post.Platform);
+            var account = await Publisher.Destination(db, metricoolSettings, post.BrandId, post.Platform);
             var scheduled = input.Action == "publish" ? DateTime.UtcNow : input.ScheduledAt?.ToUniversalTime();
             Rules.Require(scheduled.HasValue && (input.Action == "publish" || scheduled > DateTime.UtcNow), "Choose a future date and time.");
-            Rules.Require(account is not null && account.VerifiedAt.HasValue && account.ExpiresAt > scheduled, "Connect and verify an account with a token valid through the publish time.");
+            Rules.Require(account is not null && account.VerifiedAt.HasValue && account.ExpiresAt > scheduled, "Map this brand to Metricool, or connect and verify an account with a token valid through the publish time.");
+            var viaMetricool = account!.Platform == MetricoolClient.Platform;
+            if (viaMetricool) Rules.Require((await metricool.Brand(account.ExternalId)).Networks.Contains(post.Platform), $"Connect {post.Platform} to the Metricool brand '{account.Name}' first.");
             Rules.Require(post.Platform != "Instagram" || post.AssetId.Length > 0, "Instagram requires an image.");
-            if (post.AssetId.Length > 0 && post.Platform is "Instagram" or "Facebook") Rules.Require(Rules.PublicUrl(builder.Configuration), "Configure an HTTPS PublicBaseUrl so Meta can retrieve the creative.");
+            if (post.AssetId.Length > 0 && (viaMetricool || post.Platform is "Instagram" or "Facebook")) Rules.Require(Rules.PublicUrl(builder.Configuration), $"Configure an HTTPS PublicBaseUrl so {(viaMetricool ? "Metricool" : "Meta")} can retrieve the creative.");
             if (post.Platform == "Instagram") Rules.Require((await db.Assets.FindAsync(post.AssetId))?.ContentType == "image/jpeg", "Instagram requires a JPEG creative. Use the creative builder or upload a JPEG.");
             post.Status = "Scheduled"; post.ScheduledAt = scheduled; break;
         case "archive": Rules.Require(old is not "Publishing" and not "Scheduled", "Cancel scheduling before archiving."); post.Status = "Archived"; break;
@@ -188,7 +223,7 @@ api.MapPost("/posts/{id:int}/transition", async (int id, TransitionInput input, 
 api.MapGet("/brands/{brandId:int}/accounts", async (int brandId, HttpContext ctx, MarketingDb db) => { await Rules.Brand(ctx, db, brandId); return await db.Accounts.Where(x => x.BrandId == brandId).ToListAsync(); });
 api.MapPost("/brands/{brandId:int}/accounts", async (int brandId, AccountInput input, HttpContext ctx, MarketingDb db, IDataProtectionProvider protection) =>
 {
-    Rules.Admin(ctx); await Rules.Brand(ctx, db, brandId); Rules.Platform(input.Platform);
+    Rules.Admin(ctx); await Rules.Brand(ctx, db, brandId); Rules.DirectPlatform(input.Platform);
     Rules.Require(input.Name.Length is > 0 and <= 100 && input.Token.Length is > 10 and < 8000 && input.ExpiresAt > DateTime.UtcNow, "Provide a label, valid token and future expiry.");
     Rules.Require(input.Platform == "LinkedIn" ? System.Text.RegularExpressions.Regex.IsMatch(input.ExternalId, "^urn:li:(organization|person):[A-Za-z0-9_-]+$") : System.Text.RegularExpressions.Regex.IsMatch(input.ExternalId, "^[0-9]+$"), "Use a LinkedIn author URN or numeric Meta account ID.");
     var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == input.Platform) ?? new SocialAccount { BrandId = brandId, Platform = input.Platform };
@@ -196,6 +231,53 @@ api.MapPost("/brands/{brandId:int}/accounts", async (int brandId, AccountInput i
     account.Name = input.Name; account.ExternalId = input.ExternalId; account.ExpiresAt = input.ExpiresAt.ToUniversalTime(); account.VerifiedAt = null;
     account.ProtectedToken = protection.CreateProtector("social-tokens-v1").Protect(input.Token);
     await db.SaveChangesAsync(); return account;
+});
+object MetricoolStatus(MetricoolSettings s) => new { configured = s.Configured, source = s.Source, userId = s.Current?.UserId ?? "", updatedAt = s.UpdatedAt };
+api.MapGet("/settings/metricool", (HttpContext ctx, MetricoolSettings settings) => { Rules.Admin(ctx); return MetricoolStatus(settings); });
+api.MapPut("/settings/metricool", (MetricoolSettingsInput input, HttpContext ctx, MetricoolSettings settings) =>
+{
+    Rules.Admin(ctx); settings.Save(input.UserId.Trim(), input.Token);
+    app.Logger.LogInformation("Metricool settings changed by user {UserId}", Rules.UserId(ctx));
+    return MetricoolStatus(settings);
+});
+api.MapDelete("/settings/metricool", (HttpContext ctx, MetricoolSettings settings) => { Rules.Admin(ctx); settings.Clear(); return MetricoolStatus(settings); });
+object OpenAiStatus(OpenAiSettings s) => new
+{
+    configured = s.Configured, source = s.Source, updatedAt = s.UpdatedAt, textModel = s.Current?.TextModel ?? s.DefaultTextModel, imageModel = s.Current?.ImageModel ?? s.DefaultImageModel,
+    defaultTextModel = s.DefaultTextModel, defaultImageModel = s.DefaultImageModel
+};
+object LinkStatus(LinkTracking s) => new { enabled = s.Enabled, medium = s.Medium, updatedAt = s.UpdatedAt };
+api.MapGet("/settings/links", (HttpContext ctx, LinkTracking settings) => { Rules.Admin(ctx); return LinkStatus(settings); });
+api.MapPut("/settings/links", (LinkTrackingInput input, HttpContext ctx, LinkTracking settings) => { Rules.Admin(ctx); settings.Save(input.Enabled, input.Medium); return LinkStatus(settings); });
+api.MapGet("/settings/openai", (HttpContext ctx, OpenAiSettings settings) => { Rules.Admin(ctx); return OpenAiStatus(settings); });
+api.MapPut("/settings/openai", async (OpenAiSettingsInput input, HttpContext ctx, OpenAiSettings settings) =>
+{
+    Rules.Admin(ctx); await settings.Save(input.ApiKey, input.TextModel, input.ImageModel);
+    app.Logger.LogInformation("OpenAI settings changed by user {UserId}", Rules.UserId(ctx));
+    return OpenAiStatus(settings);
+});
+api.MapDelete("/settings/openai", (HttpContext ctx, OpenAiSettings settings) => { Rules.Admin(ctx); settings.Clear(); return OpenAiStatus(settings); });
+api.MapGet("/brands/{brandId:int}/metricool", async (int brandId, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings settings) =>
+{
+    await Rules.Brand(ctx, db, brandId);
+    var configured = settings.Configured;
+    var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform);
+    if (!configured || account is null) return Results.Ok(new { configured, account, networks = (string[]?)null, error = "" });
+    try { return Results.Ok(new { configured, account, networks = (string[]?)(await metricool.Brand(account.ExternalId)).Networks, error = "" }); }
+    catch (RuleException e) { return Results.Ok(new { configured, account, networks = (string[]?)null, error = e.Message }); }
+});
+api.MapPut("/brands/{brandId:int}/metricool", async (int brandId, MetricoolInput input, HttpContext ctx, MarketingDb db, MetricoolClient metricool, MetricoolSettings settings) =>
+{
+    Rules.Admin(ctx); await Rules.Brand(ctx, db, brandId);
+    Rules.Require(settings.Configured, "Add the Metricool user ID and API token under Settings first.");
+    Rules.Require(System.Text.RegularExpressions.Regex.IsMatch(input.BlogId, "^[0-9]{1,18}$"), "Enter the numeric Metricool brand ID (the blogId in the Metricool address bar).");
+    var remote = await metricool.Brand(input.BlogId);
+    var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform) ?? new SocialAccount { BrandId = brandId, Platform = MetricoolClient.Platform };
+    if (account.Id == 0) db.Accounts.Add(account);
+    // No per-brand token: the server-wide Metricool token is used. Mapping is verified against Metricool just above.
+    account.ExternalId = remote.BlogId; account.Name = remote.Label; account.ExpiresAt = new DateTime(2100, 1, 1, 0, 0, 0, DateTimeKind.Utc); account.VerifiedAt = DateTime.UtcNow;
+    db.Audit.Add(new AuditEntry { BrandId = brandId, UserId = Rules.UserId(ctx), Action = $"Mapped to Metricool brand {remote.Label}" });
+    await db.SaveChangesAsync(); return new { configured = true, account, networks = (string[]?)remote.Networks, error = "" };
 });
 api.MapPost("/accounts/{id:int}/verify", async (int id, HttpContext ctx, MarketingDb db, Publisher publisher) =>
 {
@@ -205,13 +287,13 @@ api.MapPost("/accounts/{id:int}/verify", async (int id, HttpContext ctx, Marketi
 api.MapDelete("/accounts/{id:int}", async (int id, HttpContext ctx, MarketingDb db) =>
 {
     Rules.Admin(ctx); var account = await db.Accounts.FindAsync(id) ?? throw new RuleException("Account not found.", 404); await Rules.Brand(ctx, db, account.BrandId);
-    Rules.Require(!await db.Posts.AnyAsync(x => x.BrandId == account.BrandId && x.Platform == account.Platform && (x.Status == "Scheduled" || x.Status == "Publishing")), "Cancel scheduled posts before disconnecting this account.");
+    Rules.Require(!await db.Posts.AnyAsync(x => x.BrandId == account.BrandId && (account.Platform == MetricoolClient.Platform || x.Platform == account.Platform) && (x.Status == "Scheduled" || x.Status == "Publishing")), "Cancel scheduled posts before disconnecting this account.");
     db.Accounts.Remove(account); await db.SaveChangesAsync(); return Results.Ok();
 });
 api.MapPost("/brands/{brandId:int}/assets", async (int brandId, HttpContext ctx, MarketingDb db, Storage files) =>
 {
     await Rules.Brand(ctx, db, brandId); var form = await ctx.Request.ReadFormAsync(); var file = form.Files.FirstOrDefault();
-    Rules.Require(file is not null && file.Length is > 0 and <= 5_000_000, "Upload a JPEG or PNG under 5 MB.");
+    Rules.Require(file is not null && file.Length is > 0 and <= 10_000_000, "Upload a JPEG or PNG under 5 MB, or a PDF carousel under 10 MB.");
     using var ms = new MemoryStream(); await file!.CopyToAsync(ms);
     return await files.Save(db, brandId, ms.ToArray(), Path.GetFileName(file.FileName));
 });
@@ -227,7 +309,23 @@ app.MapGet("/media/{id}", async (string id, MarketingDb db, Storage files) =>
 });
 api.MapPost("/brands/{brandId:int}/generate", async (int brandId, GenerateInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
 {
-    var brand = await Rules.Brand(ctx, db, brandId); Rules.Platform(input.Platform); Rules.Require(input.Brief.Length is > 5 and <= 4000, "Enter a brief between 6 and 4,000 characters."); return await service.Generate(brand, input);
+    var brand = await Rules.Brand(ctx, db, brandId); Rules.Platform(input.Platform); Rules.Require(input.Brief.Length <= 4000, "Keep the brief under 4,000 characters."); return await service.Generate(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/plan", async (int brandId, PlanInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Plan(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/repurpose", async (int brandId, RepurposeInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Repurpose(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/carousel", async (int brandId, CarouselInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Carousel(brand, input);
+}).RequireRateLimiting("ai");
+api.MapPost("/brands/{brandId:int}/article", async (int brandId, ArticleInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
+{
+    var brand = await Rules.Brand(ctx, db, brandId); return await service.Article(brand, input);
 }).RequireRateLimiting("ai");
 api.MapPost("/brands/{brandId:int}/generate-image", async (int brandId, GenerateInput input, HttpContext ctx, MarketingDb db, ContentService service) =>
 {
@@ -256,13 +354,24 @@ api.MapPut("/team/{id:int}", async (int id, AccessInput input, HttpContext ctx, 
 });
 api.MapGet("/audit", async (HttpContext ctx, MarketingDb db) => { var ids = Rules.Brands(ctx, db).Select(x => x.Id); return await db.Audit.Where(x => ids.Contains(x.BrandId)).OrderByDescending(x => x.At).Take(100).ToListAsync(); });
 app.Map("/api/{**path}", () => Results.NotFound(new { error = "API endpoint not found." }));
-app.MapFallbackToFile("index.html");
+app.MapFallbackToFile("index.html", revalidate);
 app.Run();
 
 public record LoginInput(string Email, string Password);
 public record BrandInput(string Name, string Website, string Color, string Tone, string Audience, string Description, string LogoAssetId = "");
-public record PostInput(string Title, string Platform, string Caption, string AssetId = "", int Version = 0);
+// SuggestedAt is the AI's (or the author's) proposed publish time for a draft; scheduling still needs approval.
+public record PostInput(string Title, string Platform, string Caption, string AssetId = "", int Version = 0, DateTime? SuggestedAt = null);
+public record RepurposeInput(string StartDate, string[] Platforms, int Posts, string Url = "", string Text = "", string Title = "", string TimeZone = "");
+public record CarouselInput(string Brief = "", int Slides = 6);
+public record ArticleInput(string Topic = "", string Keyword = "", int Words = 1200);
+public record LinkTrackingInput(bool Enabled, string Medium = "");
+// With Dates, the plan has exactly one post per chosen date and channel; otherwise it spreads posts over the weeks.
+public record PlanInput(string StartDate, int Weeks, int PostsPerWeek, string[] Platforms, string Goal = "", string TimeZone = "", PlanDate[]? Dates = null);
+public record PlanDate(string Date, string Platform, string Note = "");
 public record TransitionInput(string Action, int Version, DateTime? ScheduledAt = null, string Note = "");
+public record MetricoolInput(string BlogId);
+public record MetricoolSettingsInput(string UserId, string Token = "");
+public record OpenAiSettingsInput(string ApiKey = "", string TextModel = "", string ImageModel = "");
 public record AccountInput(string Platform, string Name, string ExternalId, string Token, DateTime ExpiresAt);
 public record GenerateInput(string Brief, string Platform = "LinkedIn");
 public record UserInput(string Name, string Email, string Password, string Role, int[] BrandIds);

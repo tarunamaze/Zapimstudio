@@ -5,6 +5,8 @@ services:
       - "127.0.0.1:5080:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Production
+      # Trust X-Forwarded-For/Proto from the TLS reverse proxy (the port is bound to 127.0.0.1 only).
+      ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"
       Bootstrap__Email: ${BOOTSTRAP_EMAIL:?Set BOOTSTRAP_EMAIL}
       Bootstrap__Password: ${BOOTSTRAP_PASSWORD:?Set BOOTSTRAP_PASSWORD}
       AI__ApiKey: ${OPENAI_API_KEY:-}

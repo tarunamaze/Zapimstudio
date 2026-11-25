@@ -20,7 +20,9 @@ public static class Rules
     {
         var p = await db.Posts.FindAsync(id) ?? throw new RuleException("Post not found.", 404); await Brand(ctx, db, p.BrandId); return p;
     }
-    public static void Platform(string platform) => Require(platform is "LinkedIn" or "Instagram" or "Facebook", "Choose LinkedIn, Instagram or Facebook.");
+    public static void Platform(string platform) => Require(ContentService.Platforms.Contains(platform), "Choose LinkedIn, Instagram, Facebook or Google Business.");
+    // Google Business Profile has no direct connection here: it is published through Metricool.
+    public static void DirectPlatform(string platform) => Require(platform is "LinkedIn" or "Instagram" or "Facebook", "Choose LinkedIn, Instagram or Facebook. Google Business posts are published through Metricool.");
     public static void ValidateLogin(LoginInput i)
     {
         Require(!string.IsNullOrWhiteSpace(i.Email) && i.Email.Length <= 254 && System.Net.Mail.MailAddress.TryCreate(i.Email, out var addr) && addr.Address == i.Email.Trim(), "Enter a valid email.");
@@ -36,11 +38,17 @@ public static class Rules
     public static async Task ValidatePost(PostInput i, int brandId, MarketingDb db)
     {
         Platform(i.Platform); Require(!string.IsNullOrWhiteSpace(i.Title) && i.Title.Length <= 160, "Add a title under 160 characters.");
-        var limit = i.Platform == "Instagram" ? 2200 : i.Platform == "LinkedIn" ? 3000 : 63206;
+        var limit = i.Platform == "Facebook" ? 63206 : ContentService.CaptionLimit(i.Platform);
         Require(!string.IsNullOrWhiteSpace(i.Caption) && i.Caption.Length <= limit, $"Add a caption under {limit:N0} characters.");
-        if (i.AssetId != "") Require(await db.Assets.AnyAsync(a => a.Id == i.AssetId && a.BrandId == brandId), "Choose an asset belonging to this brand.");
+        if (i.AssetId != "")
+        {
+            var asset = await db.Assets.SingleOrDefaultAsync(a => a.Id == i.AssetId && a.BrandId == brandId);
+            Require(asset is not null, "Choose an asset belonging to this brand.");
+            Require(asset!.ContentType != "application/pdf" || i.Platform == "LinkedIn", "PDF carousels can only be posted to LinkedIn.");
+        }
+        Require(i.SuggestedAt is null || (i.SuggestedAt > DateTime.UtcNow.AddYears(-1) && i.SuggestedAt < DateTime.UtcNow.AddYears(2)), "Choose a suggested publish time within the next two years.");
     }
-    public static void ApplyPost(Post p, PostInput i) { p.Title = i.Title.Trim(); p.Platform = i.Platform; p.Caption = i.Caption.Trim(); p.AssetId = i.AssetId; }
+    public static void ApplyPost(Post p, PostInput i) { p.Title = i.Title.Trim(); p.Platform = i.Platform; p.Caption = i.Caption.Trim(); p.AssetId = i.AssetId; p.ScheduledAt = i.SuggestedAt?.ToUniversalTime(); }
     public static bool PublicUrl(IConfiguration c) => Uri.TryCreate(c["PublicBaseUrl"], UriKind.Absolute, out var uri) && uri.Scheme == "https" && !uri.IsLoopback;
 }
 public class Storage(string root)
@@ -49,11 +57,13 @@ public class Storage(string root)
     public string AssetPath(string id) => Path.Combine(Root, "assets", id);
     public async Task<Asset> Save(MarketingDb db, int brandId, byte[] bytes, string name)
     {
-        Rules.Require(bytes.Length is > 8 and <= 5_000_000, "Image must be under 5 MB.");
+        Rules.Require(bytes.Length > 8, "The file is empty.");
         var jpeg = bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
         var png = bytes.Take(8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
-        Rules.Require(jpeg || png, "Only JPEG and PNG images are accepted.");
-        var asset = new Asset { BrandId = brandId, Name = name[..Math.Min(name.Length, 160)], ContentType = jpeg ? "image/jpeg" : "image/png" };
+        var pdf = bytes.Take(5).SequenceEqual("%PDF-"u8.ToArray());
+        Rules.Require(jpeg || png || pdf, "Only JPEG and PNG images, or PDF carousels, are accepted.");
+        Rules.Require(bytes.Length <= (pdf ? 10_000_000 : 5_000_000), pdf ? "A PDF carousel must be under 10 MB." : "Image must be under 5 MB.");
+        var asset = new Asset { BrandId = brandId, Name = name[..Math.Min(name.Length, 160)], ContentType = jpeg ? "image/jpeg" : png ? "image/png" : "application/pdf" };
         await File.WriteAllBytesAsync(AssetPath(asset.Id), bytes); db.Assets.Add(asset); await db.SaveChangesAsync(); return asset;
     }
 }

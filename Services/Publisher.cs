@@ -4,8 +4,14 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
 namespace Zapim.Marketing;
-public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db)
+public class Publisher(IHttpClientFactory factory, IDataProtectionProvider protection, IConfiguration config, Storage storage, MarketingDb db, MetricoolClient metricool, LinkTracking links)
 {
+    // Where a brand's post goes: its Metricool brand when Metricool is configured and mapped, otherwise its own platform account.
+    public static async Task<SocialAccount?> Destination(MarketingDb db, MetricoolSettings metricool, int brandId, string platform, CancellationToken ct = default)
+    {
+        if (metricool.Configured && await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == MetricoolClient.Platform, ct) is { } mapped) return mapped;
+        return await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == brandId && x.Platform == platform, ct);
+    }
     private HttpClient Client => factory.CreateClient("external");
     private string Token(SocialAccount a) => protection.CreateProtector("social-tokens-v1").Unprotect(a.ProtectedToken);
     private string Graph => $"https://graph.facebook.com/{config["Publishing:MetaVersion"]}";
@@ -26,6 +32,7 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
     }
     public async Task Verify(SocialAccount a)
     {
+        if (a.Platform == MetricoolClient.Platform) { a.Name = (await metricool.Brand(a.ExternalId)).Label; return; }
         Rules.Require(a.ExpiresAt > DateTime.UtcNow, "This access token has expired.");
         string url;
         if (a.Platform == "LinkedIn")
@@ -38,34 +45,47 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
     public async Task<string> Publish(Post post, SocialAccount a, CancellationToken ct)
     {
         Rules.Require(a.ExpiresAt > DateTime.UtcNow, "Account token expired. Reconnect the account.");
+        // Replacing a token clears VerifiedAt; never publish with a token nobody has verified.
+        Rules.Require(a.VerifiedAt.HasValue, "The account token was replaced and has not been verified. Verify the account, then reschedule this post.");
         var image = post.AssetId.Length > 0 ? await db.Assets.FindAsync([post.AssetId], ct) : null;
         var mediaUrl = $"{config["PublicBaseUrl"]?.TrimEnd('/')}/media/{post.AssetId}";
+        var document = image?.ContentType == "application/pdf";
+        Rules.Require(!document || post.Platform == "LinkedIn", "PDF carousels can only be posted to LinkedIn.");
+        // UTM tags are added here, so the caption the team edits stays clean.
+        var caption = links.Apply(post.Caption, (await db.Brands.FindAsync([post.BrandId], ct))?.Website ?? "", post.Platform, post.Title);
+        if (a.Platform == MetricoolClient.Platform)
+        {
+            Rules.Require(post.Platform != "Instagram" || image?.ContentType == "image/jpeg", "Instagram requires a JPEG image.");
+            return "metricool:" + await metricool.Schedule(post, caption, a.ExternalId, image is null ? null : mediaUrl, document, ct);
+        }
         if (a.Platform == "LinkedIn")
         {
             string? imageUrn = null;
+            // Images and documents (PDF carousels) use the same upload flow on different LinkedIn resources.
+            var (resource, key) = document ? ("documents", "document") : ("images", "image");
             if (image is not null)
             {
-                var init = Request(HttpMethod.Post, "https://api.linkedin.com/rest/images?action=initializeUpload", a, true);
+                var init = Request(HttpMethod.Post, $"https://api.linkedin.com/rest/{resource}?action=initializeUpload", a, true);
                 init.Content = JsonContent.Create(new { initializeUploadRequest = new { owner = a.ExternalId } });
                 using var initialized = await Json(init, ct);
-                var value = initialized.RootElement.GetProperty("value"); imageUrn = value.GetProperty("image").GetString();
+                var value = initialized.RootElement.GetProperty("value"); imageUrn = value.GetProperty(key).GetString();
                 var uri = new Uri(value.GetProperty("uploadUrl").GetString()!);
                 Rules.Require(uri.Scheme == "https" && (uri.Host.EndsWith(".linkedin.com") || uri.Host.EndsWith(".licdn.com")), "Unexpected LinkedIn upload destination.");
                 using var upload = Request(HttpMethod.Put, uri.AbsoluteUri, a);
                 upload.Content = new ByteArrayContent(await File.ReadAllBytesAsync(storage.AssetPath(image.Id), ct));
                 upload.Content.Headers.ContentType = new MediaTypeHeaderValue(image.ContentType);
-                using var uploaded = await Client.SendAsync(upload, ct); Rules.Require(uploaded.IsSuccessStatusCode, "LinkedIn image upload failed.", 502);
+                using var uploaded = await Client.SendAsync(upload, ct); Rules.Require(uploaded.IsSuccessStatusCode, $"LinkedIn {key} upload failed.", 502);
                 var available = false;
                 for (var i = 0; i < 12; i++)
                 {
-                    using var status = await Json(Request(HttpMethod.Get, "https://api.linkedin.com/rest/images/" + Uri.EscapeDataString(imageUrn!), a, true), ct);
+                    using var status = await Json(Request(HttpMethod.Get, $"https://api.linkedin.com/rest/{resource}/" + Uri.EscapeDataString(imageUrn!), a, true), ct);
                     var state = status.RootElement.GetProperty("status").GetString();
                     if (state == "AVAILABLE") { available = true; break; }
-                    Rules.Require(state != "PROCESSING_FAILED", "LinkedIn could not process this image."); await Task.Delay(1500, ct);
+                    Rules.Require(state != "PROCESSING_FAILED", $"LinkedIn could not process this {key}."); await Task.Delay(1500, ct);
                 }
-                Rules.Require(available, "LinkedIn image processing timed out.");
+                Rules.Require(available, $"LinkedIn {key} processing timed out.");
             }
-            var body = new Dictionary<string, object> { ["author"] = a.ExternalId, ["commentary"] = post.Caption, ["visibility"] = "PUBLIC", ["distribution"] = new { feedDistribution = "MAIN_FEED", targetEntities = Array.Empty<string>(), thirdPartyDistributionChannels = Array.Empty<string>() }, ["lifecycleState"] = "PUBLISHED", ["isReshareDisabledByAuthor"] = false };
+            var body = new Dictionary<string, object> { ["author"] = a.ExternalId, ["commentary"] = caption, ["visibility"] = "PUBLIC", ["distribution"] = new { feedDistribution = "MAIN_FEED", targetEntities = Array.Empty<string>(), thirdPartyDistributionChannels = Array.Empty<string>() }, ["lifecycleState"] = "PUBLISHED", ["isReshareDisabledByAuthor"] = false };
             if (imageUrn is not null) body["content"] = new { media = new { id = imageUrn, title = post.Title } };
             using var request = Request(HttpMethod.Post, "https://api.linkedin.com/rest/posts", a, true); request.Content = JsonContent.Create(body);
             using var response = await Client.SendAsync(request, ct);
@@ -76,12 +96,12 @@ public class Publisher(IHttpClientFactory factory, IDataProtectionProvider prote
         if (a.Platform == "Facebook")
         {
             var request = Request(HttpMethod.Post, $"{Graph}/{a.ExternalId}/{(image is null ? "feed" : "photos")}", a);
-            request.Content = new FormUrlEncodedContent(image is null ? new Dictionary<string, string> { ["message"] = post.Caption } : new Dictionary<string, string> { ["caption"] = post.Caption, ["url"] = mediaUrl, ["published"] = "true" });
+            request.Content = new FormUrlEncodedContent(image is null ? new Dictionary<string, string> { ["message"] = caption } : new Dictionary<string, string> { ["caption"] = caption, ["url"] = mediaUrl, ["published"] = "true" });
             using var result = await Json(request, ct); return result.RootElement.TryGetProperty("post_id", out var p) ? p.GetString()! : result.RootElement.GetProperty("id").GetString()!;
         }
         Rules.Require(image is not null && image.ContentType == "image/jpeg", "Instagram requires a JPEG image.");
         var containerRequest = Request(HttpMethod.Post, $"{Graph}/{a.ExternalId}/media", a);
-        containerRequest.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["image_url"] = mediaUrl, ["caption"] = post.Caption });
+        containerRequest.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["image_url"] = mediaUrl, ["caption"] = caption });
         using var container = await Json(containerRequest, ct); var containerId = container.RootElement.GetProperty("id").GetString();
         var ready = false;
         for (var i = 0; i < 20; i++)
@@ -109,14 +129,23 @@ public class PublishingWorker(IServiceScopeFactory scopes, IConfiguration config
             {
                 using var scope = scopes.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<MarketingDb>();
                 var due = await db.Posts.AsNoTracking().Where(x => x.Status == "Scheduled" && x.ScheduledAt <= DateTime.UtcNow).OrderBy(x => x.ScheduledAt).Take(10).ToListAsync(stoppingToken);
+                var maxLateness = TimeSpan.FromMinutes(config.GetValue("Publishing:MaxLatenessMinutes", 60));
                 foreach (var p in due)
                 {
+                    // After downtime or while publishing was disabled, don't release a backlog of stale posts at the wrong time.
+                    if (p.ScheduledAt < DateTime.UtcNow - maxLateness)
+                    {
+                        var error = $"Not published: the scheduled time passed more than {maxLateness.TotalMinutes:0} minutes before the scheduler could run. Nothing was sent. Duplicate the post and schedule a new time.";
+                        var expired = await db.Posts.Where(x => x.Id == p.Id && x.Status == "Scheduled" && x.Version == p.Version).ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "NeedsAttention").SetProperty(x => x.Error, error).SetProperty(x => x.Version, x => x.Version + 1).SetProperty(x => x.UpdatedAt, DateTime.UtcNow), stoppingToken);
+                        if (expired == 1) { db.Audit.Add(new AuditEntry { BrandId = p.BrandId, PostId = p.Id, Action = "Missed schedule; not published" }); await db.SaveChangesAsync(stoppingToken); }
+                        continue;
+                    }
                     var claimed = await db.Posts.Where(x => x.Id == p.Id && x.Status == "Scheduled" && x.Version == p.Version).ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "Publishing").SetProperty(x => x.Version, x => x.Version + 1).SetProperty(x => x.UpdatedAt, DateTime.UtcNow), stoppingToken);
                     if (claimed != 1) continue;
                     var post = await db.Posts.FindAsync([p.Id], stoppingToken);
                     try
                     {
-                        var account = await db.Accounts.SingleOrDefaultAsync(x => x.BrandId == p.BrandId && x.Platform == p.Platform, stoppingToken) ?? throw new RuleException("Social account is disconnected.");
+                        var account = await Publisher.Destination(db, scope.ServiceProvider.GetRequiredService<MetricoolSettings>(), p.BrandId, p.Platform, stoppingToken) ?? throw new RuleException("Social account is disconnected.");
                         post!.RemoteId = await scope.ServiceProvider.GetRequiredService<Publisher>().Publish(post, account, stoppingToken);
                         post.Status = "Published"; post.PublishedAt = DateTime.UtcNow; post.Error = "";
                     }
@@ -127,7 +156,7 @@ public class PublishingWorker(IServiceScopeFactory scopes, IConfiguration config
                         logger.LogWarning("Post {Id} needs attention ({Type})", p.Id, e.GetType().Name);
                     }
                     post!.UpdatedAt = DateTime.UtcNow; post.Version++;
-                    db.Audit.Add(new AuditEntry { BrandId = post.BrandId, PostId = post.Id, Action = post.Status == "Published" ? "Published to " + post.Platform : "Delivery needs attention" });
+                    db.Audit.Add(new AuditEntry { BrandId = post.BrandId, PostId = post.Id, Action = post.Status != "Published" ? "Delivery needs attention" : post.RemoteId.StartsWith("metricool:") ? $"Sent to Metricool for {post.Platform}" : "Published to " + post.Platform });
                     await db.SaveChangesAsync(stoppingToken);
                 }
             }
