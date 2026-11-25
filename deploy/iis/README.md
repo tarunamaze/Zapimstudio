@@ -66,7 +66,7 @@ A dedicated login with rights on `ZapimMarketing` only (like HRMS's `hrms_app`) 
 
 Open the project, then **Build → Publish → zapimmarketing** (the profile is in `Properties\PublishProfiles\zapimmarketing.pubxml`) and enter the server's `Administrator` password when prompted. Accept the self-signed certificate on port 8172, as for HRMS.
 
-The profile never overwrites `appsettings.Production.json` or the `logs` folder, and takes the site offline (`app_offline.htm`) while copying. Publishing from the command line works too:
+The profile never overwrites `appsettings.Production.json` or the `logs` folder, and takes the site offline (`app_offline.htm`) while copying. From any PC with the .NET 10 SDK and Web Deploy, `.\deploy\iis\publish.ps1` publishes with this profile, asks for the password without displaying it, and checks `/health`. Publishing from the command line works too:
 
 ```powershell
 dotnet publish Zapim.Marketing.csproj -c Release /p:PublishProfile=zapimmarketing /p:Password=<password>
